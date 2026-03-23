@@ -1,0 +1,44 @@
+[package]
+name = "graphstream"
+version = "0.1.0"
+edition = "2021"
+description = "Journal replication engine for graph databases. Logical WAL shipping via .graphj segments to S3."
+authors = ["Russell Romney <russellromney@gmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/russellromney/graphstream"
+keywords = ["graph-database", "replication", "journal", "s3", "wal"]
+categories = ["database", "network-programming"]
+
+[dependencies]
+# Crypto + integrity
+sha2 = "0.10"
+crc32c = "0.6"
+chacha20poly1305 = "0.10"
+rand = "0.9"
+
+# Compression
+zstd = "0.13"
+
+# Protobuf
+prost = "0.13"
+
+# S3
+aws-sdk-s3 = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Logging
+tracing = "0.1"
+
+# Serialization (for ParamValue)
+serde = { version = "1", features = ["derive"] }
+
+[build-dependencies]
+prost-build = "0.13"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+uuid = { version = "1", features = ["v4"] }

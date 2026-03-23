@@ -1,0 +1,41 @@
+//! graphstream — journal replication engine for graph databases.
+//!
+//! Logical WAL shipping via .graphj segments to S3. This crate provides the
+//! replication machinery that graphd uses: journal format, writer/reader,
+//! S3 uploader, and follower sync.
+//!
+//! graphstream is to Kuzu/graphd what walrust is to SQLite — the replication
+//! engine, not the database server.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub mod graphj;
+pub mod journal;
+pub mod sync;
+pub mod types;
+pub mod uploader;
+
+// Protobuf types (same package name as graphd — wire-compatible).
+pub mod graphd {
+    include!(concat!(env!("OUT_DIR"), "/graphd.rs"));
+}
+
+/// Current timestamp in epoch milliseconds.
+pub fn current_timestamp_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+// Re-exports for convenience.
+pub use journal::{
+    spawn_journal_writer, JournalCommand, JournalReader, JournalReaderEntry, JournalSender,
+    JournalState, PendingEntry,
+};
+pub use sync::download_new_segments;
+pub use types::{
+    graph_value_to_param_value, map_entries_to_param_values, param_value_to_graph_value,
+    param_values_to_map_entries, ParamValue,
+};
+pub use uploader::spawn_journal_uploader;
