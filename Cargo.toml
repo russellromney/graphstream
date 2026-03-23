@@ -38,6 +38,9 @@ serde = { version = "1", features = ["derive"] }
 # Error handling
 anyhow = "1"
 
+# Async traits
+async-trait = "0.1"
+
 # Hex encoding (for recovery.json chain hash)
 hex = "0.4"
 

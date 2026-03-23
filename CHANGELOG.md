@@ -1,5 +1,26 @@
 # graphstream Changelog
 
+## Phase 4: Concurrent S3 Uploads via JoinSet
+
+Replaced sequential upload loop with concurrent `JoinSet`-based uploader. Sequential S3 uploads (100-500ms each) were the throughput bottleneck — now up to 4 concurrent uploads (configurable `max_concurrent`).
+
+### Architecture
+- `SegmentStorage` trait — abstracts upload destination (S3, mock). Enables unit testing without real S3.
+- `S3SegmentStorage` — wraps `aws_sdk_s3::Client` + bucket.
+- `UploadTaskContext` — cloned into each spawned task (Arc'd storage, retry_policy, stats).
+- `Uploader` — JoinSet-based concurrent upload engine with `run()` loop.
+- `spawn_uploader()` returns `(Sender<UploadMessage>, JoinHandle)` — callers must await handle after shutdown for graceful drain.
+- `spawn_journal_uploader` / `spawn_journal_uploader_with_retry` — high-level API combining seal timer + concurrent uploader. Now returns `(upload_tx, handle)` instead of just `handle`.
+
+### Key patterns (from walrust v0.6.0)
+- `UploadMessage::Upload(PathBuf)` / `UploadMessage::Shutdown`
+- `tokio::select!` with `if in_flight.len() < max_concurrent` guard
+- Shutdown drains all in-flight uploads before exiting
+- File bytes read once, shared across retry attempts via `Arc<Vec<u8>>`
+
+### Tests (8 unit)
+- `test_basic_upload`, `test_multiple_uploads`, `test_concurrent_uploads_respect_limit`, `test_concurrent_is_faster_than_sequential`, `test_shutdown_drains_in_flight`, `test_failure_doesnt_block_others`, `test_channel_close_drains`, `test_stats_tracking`
+
 ## Phase 3: O(1) Recovery via Chain Hash Trailer
 
 Replaced `recovery.json` (non-atomic, ACID-unsafe) with a 32-byte chain hash trailer appended to sealed `.graphj` segments. The trailer is written atomically with the seal operation (header + compressed body + trailer + fsync), eliminating any consistency window.

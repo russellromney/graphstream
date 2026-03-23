@@ -2,23 +2,6 @@
 
 ## Phase 1: Uploader Improvements
 
-### Concurrent uploads via JoinSet
-
-walrust v0.6.0 proved the pattern: sequential S3 uploads (100-500ms each) are the throughput bottleneck. Replace the sequential upload loop with `tokio::task::JoinSet` bounded by `max_concurrent` (default 4):
-
-```rust
-tokio::select! {
-    msg = rx.recv(), if in_flight.len() < max_concurrent => { /* spawn */ }
-    Some(result) = in_flight.join_next() => { /* reap */ }
-}
-```
-
-Key pattern: extract an `UploadTaskContext` struct holding cloned `Arc`s (storage, retry_policy, cache, stats) to avoid `&self` lifetime issues with `JoinSet::spawn`. The uploader's `run()` method owns the JoinSet; spawned tasks get the context struct.
-
-### spawn_uploader returns JoinHandle
-
-`spawn_uploader` must return `(Sender, JoinHandle)` — not just Sender. Dropping the handle means fire-and-forget; any in-flight uploads are silently abandoned on shutdown. Callers must await the handle with a timeout after sending Shutdown.
-
 ### Disk cache + uploader decoupling
 
 walrust v0.6.0 decoupled "write to local disk" from "upload to S3" via a `LocalCache` + `Uploader` pair connected by an mpsc channel. Benefits:

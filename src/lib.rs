@@ -40,4 +40,7 @@ pub use types::{
     param_values_to_map_entries, ParamValue,
 };
 pub use retry::{RetryConfig, RetryPolicy};
-pub use uploader::{spawn_journal_uploader, spawn_journal_uploader_with_retry};
+pub use uploader::{
+    spawn_journal_uploader, spawn_journal_uploader_with_retry, spawn_uploader, SegmentStorage,
+    S3SegmentStorage, UploadMessage, Uploader, UploaderStats,
+};
