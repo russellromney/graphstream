@@ -226,6 +226,21 @@ pub fn read_header<R: Read>(r: &mut R) -> io::Result<Option<GraphjHeader>> {
     }))
 }
 
+/// Check if a `.graphj` file on disk is sealed by reading its header.
+/// Returns `false` for missing, empty, corrupt, or unsealed files.
+pub fn is_file_sealed(path: &Path) -> Result<bool, String> {
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => return Err(format!("Open {}: {e}", path.display())),
+    };
+    match read_header(&mut f) {
+        Ok(Some(header)) => Ok(header.is_sealed()),
+        Ok(None) => Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(format!("Read header {}: {e}", path.display())),
+    }
+}
+
 /// Read the 32-byte chain hash trailer from a sealed `.graphj` file.
 /// The file must have `FLAG_HAS_CHAIN_HASH` set and be sealed.
 /// Trailer is at offset `HEADER_SIZE + body_len`.
@@ -517,6 +532,190 @@ pub fn compact(
     };
 
     // Write output.
+    let mut out = std::fs::File::create(output)
+        .map_err(|e| format!("Failed to create output file: {e}"))?;
+    out.write_all(&encode_header(&header))
+        .map_err(|e| format!("Failed to write header: {e}"))?;
+    out.write_all(&body)
+        .map_err(|e| format!("Failed to write body: {e}"))?;
+    out.sync_all()
+        .map_err(|e| format!("Failed to sync output: {e}"))?;
+
+    Ok(header)
+}
+
+// ─── Streaming Compact ───
+
+/// Read one raw journal entry (48-byte header + payload) from a reader.
+/// Returns (sequence, raw_bytes) or None at EOF.
+fn read_raw_entry<R: Read>(reader: &mut R) -> Result<Option<(u64, Vec<u8>)>, String> {
+    let mut hdr = [0u8; 48];
+    match reader.read_exact(&mut hdr) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(format!("Failed to read entry header: {e}")),
+    }
+    let payload_len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+    let seq = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+
+    let mut payload = vec![0u8; payload_len];
+    reader
+        .read_exact(&mut payload)
+        .map_err(|e| format!("Truncated entry payload at seq {seq}: {e}"))?;
+
+    let mut raw = Vec::with_capacity(48 + payload_len);
+    raw.extend_from_slice(&hdr);
+    raw.extend_from_slice(&payload);
+    Ok(Some((seq, raw)))
+}
+
+/// Open a segment file and return a boxed reader for raw entries.
+/// Handles .graphj (sealed compressed/encrypted/raw) and legacy .wal formats.
+fn open_segment_reader(
+    path: &Path,
+    encryption_key: Option<&[u8; 32]>,
+) -> Result<Box<dyn Read>, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
+
+    let mut magic_buf = [0u8; 8];
+    let bytes_read = file
+        .read(&mut magic_buf)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+
+    if bytes_read >= 6 && &magic_buf[0..6] == MAGIC {
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| format!("Seek failed: {e}"))?;
+        let hdr = read_header(&mut file)
+            .map_err(|e| format!("Failed to read header from {}: {e}", path.display()))?
+            .ok_or_else(|| "Magic check inconsistency".to_string())?;
+
+        if hdr.is_sealed() && hdr.is_encrypted() {
+            // Encrypted: must decrypt entire body first.
+            let mut body = vec![0u8; hdr.body_len as usize];
+            file.read_exact(&mut body)
+                .map_err(|e| format!("Failed to read encrypted body: {e}"))?;
+            let decoded = decode_body(&hdr, &body, encryption_key)?;
+            Ok(Box::new(io::Cursor::new(decoded)))
+        } else if hdr.is_sealed() && hdr.is_compressed() {
+            // Compressed-only: stream via zstd decoder.
+            let take = file.take(hdr.body_len);
+            let decoder = zstd::Decoder::new(take)
+                .map_err(|e| format!("Failed to create zstd decoder: {e}"))?;
+            Ok(Box::new(decoder))
+        } else {
+            // Unsealed or sealed-raw.
+            Ok(Box::new(io::BufReader::with_capacity(1024 * 1024, file)))
+        }
+    } else {
+        // Legacy .wal.
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| format!("Seek failed: {e}"))?;
+        Ok(Box::new(io::BufReader::with_capacity(1024 * 1024, file)))
+    }
+}
+
+/// Streaming compaction: reads entries one at a time from input segments,
+/// writes directly to a zstd-compressed output. Avoids loading all entries
+/// into memory at once. Does NOT support encrypted output (use `compact()` for that).
+pub fn compact_streaming(
+    inputs: &[impl AsRef<Path>],
+    output: &Path,
+    compress: bool,
+    zstd_level: i32,
+    encryption_key: Option<&[u8; 32]>,
+) -> Result<GraphjHeader, String> {
+    // Phase 1: write entries to a temporary raw buffer through optional zstd encoder.
+    // We need to know total size for the header, so we write to an in-memory buffer
+    // that streams through the zstd encoder.
+    let mut first_seq: u64 = u64::MAX;
+    let mut last_seq: u64 = 0;
+    let mut entry_count: u64 = 0;
+
+    // Collect raw body bytes (optionally compressed).
+    let mut body: Vec<u8> = Vec::new();
+
+    if compress {
+        let mut encoder = zstd::Encoder::new(&mut body, zstd_level)
+            .map_err(|e| format!("Failed to create zstd encoder: {e}"))?;
+
+        for input in inputs {
+            let mut reader = open_segment_reader(input.as_ref(), encryption_key)?;
+            loop {
+                match read_raw_entry(&mut reader)? {
+                    Some((seq, raw)) => {
+                        encoder
+                            .write_all(&raw)
+                            .map_err(|e| format!("Write to encoder failed: {e}"))?;
+                        if seq < first_seq {
+                            first_seq = seq;
+                        }
+                        if seq > last_seq {
+                            last_seq = seq;
+                        }
+                        entry_count += 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        encoder
+            .finish()
+            .map_err(|e| format!("Finish zstd encoder: {e}"))?;
+    } else {
+        for input in inputs {
+            let mut reader = open_segment_reader(input.as_ref(), encryption_key)?;
+            loop {
+                match read_raw_entry(&mut reader)? {
+                    Some((seq, raw)) => {
+                        body.extend_from_slice(&raw);
+                        if seq < first_seq {
+                            first_seq = seq;
+                        }
+                        if seq > last_seq {
+                            last_seq = seq;
+                        }
+                        entry_count += 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    if entry_count == 0 {
+        first_seq = 0;
+    }
+
+    let compression_algo = if compress {
+        COMPRESSION_ZSTD
+    } else {
+        COMPRESSION_NONE
+    };
+
+    let mut flags = FLAG_SEALED;
+    if compress {
+        flags |= FLAG_COMPRESSED;
+    }
+
+    let body_checksum: [u8; 32] = Sha256::digest(&body).into();
+    let body_len = body.len() as u64;
+
+    let header = GraphjHeader {
+        flags,
+        compression: compression_algo,
+        encryption: ENCRYPTION_NONE,
+        zstd_level: if compress { zstd_level } else { 0 },
+        first_seq,
+        last_seq,
+        entry_count,
+        body_len,
+        body_checksum,
+        nonce: [0u8; 24],
+        created_ms: current_timestamp_ms(),
+    };
+
     let mut out = std::fs::File::create(output)
         .map_err(|e| format!("Failed to create output file: {e}"))?;
     out.write_all(&encode_header(&header))

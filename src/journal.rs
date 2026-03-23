@@ -252,7 +252,7 @@ fn writer_loop(
                     if let Some(ref mut f) = current_file {
                         if let Some(hasher) = body_hasher.take() {
                             let body_len = current_size - graphj::HEADER_SIZE as u64;
-                            let _ = seal_segment(
+                            if let Err(e) = seal_segment(
                                 f,
                                 segment_first_seq,
                                 segment_last_seq,
@@ -261,7 +261,9 @@ fn writer_loop(
                                 hasher,
                                 current_timestamp_ms(),
                                 prev_hash, // chain hash after last entry in old segment
-                            );
+                            ) {
+                                error!("Failed to seal segment on rotation: {e}");
+                            }
                         }
                     }
 
@@ -279,7 +281,7 @@ fn writer_loop(
                                 continue;
                             }
 
-                            info!("Journal: opened segment {}", path.display());
+                            info!(segment = %path.display(), "Journal opened segment");
                             current_file = Some(f);
                             current_size = graphj::HEADER_SIZE as u64;
                             segment_first_seq = new_seq;
@@ -317,7 +319,9 @@ fn writer_loop(
             }
             Ok(JournalCommand::Flush(ack)) => {
                 if let Some(ref mut f) = current_file {
-                    let _ = f.sync_all();
+                    if let Err(e) = f.sync_all() {
+                        error!("Journal flush sync_all failed: {e}");
+                    }
                 }
                 let _ = ack.send(());
             }
@@ -344,7 +348,7 @@ fn writer_loop(
                             "journal-{:016}.graphj",
                             segment_first_seq
                         ));
-                        info!("Journal: sealed segment for upload: {}", path.display());
+                        info!(segment = %path.display(), "Journal sealed segment for upload");
                         let _ = ack.send(Some(path));
                         // Clear current file so next write opens a new segment.
                         current_file = None;
@@ -365,7 +369,7 @@ fn writer_loop(
                     if let Some(hasher) = body_hasher.take() {
                         let body_len = current_size - graphj::HEADER_SIZE as u64;
                         let hash = *state.chain_hash.lock().unwrap_or_else(|e| e.into_inner());
-                        let _ = seal_segment(
+                        if let Err(e) = seal_segment(
                             f,
                             segment_first_seq,
                             segment_last_seq,
@@ -374,14 +378,18 @@ fn writer_loop(
                             hasher,
                             current_timestamp_ms(),
                             hash,
-                        );
+                        ) {
+                            error!("Failed to seal segment on shutdown: {e}");
+                        }
                     }
                 }
                 break;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if let Some(ref mut f) = current_file {
-                    let _ = f.sync_data();
+                    if let Err(e) = f.sync_data() {
+                        error!("Journal periodic sync_data failed: {e}");
+                    }
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -389,7 +397,7 @@ fn writer_loop(
                     if let Some(hasher) = body_hasher.take() {
                         let body_len = current_size - graphj::HEADER_SIZE as u64;
                         let hash = *state.chain_hash.lock().unwrap_or_else(|e| e.into_inner());
-                        let _ = seal_segment(
+                        if let Err(e) = seal_segment(
                             f,
                             segment_first_seq,
                             segment_last_seq,
@@ -398,7 +406,9 @@ fn writer_loop(
                             hasher,
                             current_timestamp_ms(),
                             hash,
-                        );
+                        ) {
+                            error!("Failed to seal segment on disconnect: {e}");
+                        }
                     }
                 }
                 break;
@@ -418,9 +428,11 @@ pub struct JournalReaderEntry {
 pub struct JournalReader {
     segments: Vec<PathBuf>,
     seg_idx: usize,
-    reader: Option<BufReader<File>>,
-    /// For sealed+compressed/encrypted .graphj files, we decode the body into
-    /// memory and read entries from a cursor instead of the file.
+    /// Streaming reader — either a BufReader<File> (raw/unsealed), a zstd decoder
+    /// (compressed-only), or None if using cursor_reader for encrypted segments.
+    reader: Option<Box<dyn Read>>,
+    /// For sealed+encrypted .graphj files, we must decrypt the entire body first,
+    /// then read entries from a cursor. Compressed-only uses streaming zstd instead.
     cursor_reader: Option<io::Cursor<Vec<u8>>>,
     running_hash: [u8; 32],
     start_seq: u64,
@@ -545,8 +557,8 @@ impl JournalReader {
                 .map_err(|e| format!("Failed to read .graphj header: {e}"))?
                 .ok_or_else(|| "Magic check inconsistency".to_string())?;
 
-            if hdr.is_sealed() && (hdr.is_compressed() || hdr.is_encrypted()) {
-                // Decode entire body into memory.
+            if hdr.is_sealed() && hdr.is_encrypted() {
+                // Encrypted: must decrypt entire body first, then decompress.
                 let mut body = vec![0u8; hdr.body_len as usize];
                 file.read_exact(&mut body)
                     .map_err(|e| format!("Failed to read sealed body: {e}"))?;
@@ -557,14 +569,21 @@ impl JournalReader {
                 )?;
                 self.cursor_reader = Some(io::Cursor::new(raw));
                 self.reader = None;
+            } else if hdr.is_sealed() && hdr.is_compressed() {
+                // Compressed-only: stream via zstd decoder (no full-body allocation).
+                let take = file.take(hdr.body_len);
+                let decoder = zstd::Decoder::new(take)
+                    .map_err(|e| format!("Failed to create zstd decoder: {e}"))?;
+                self.reader = Some(Box::new(decoder));
+                self.cursor_reader = None;
             } else {
                 // Unsealed or sealed-raw: reader is at offset 128 after read_header.
-                self.reader = Some(BufReader::new(file));
+                self.reader = Some(Box::new(BufReader::with_capacity(1024 * 1024, file)));
                 self.cursor_reader = None;
             }
         } else {
             // Legacy .wal: already at offset 0, read raw entries.
-            self.reader = Some(BufReader::new(file));
+            self.reader = Some(Box::new(BufReader::with_capacity(1024 * 1024, file)));
             self.cursor_reader = None;
         }
         Ok(())
@@ -644,16 +663,14 @@ const RECOVERY_FILENAME: &str = "recovery.json";
 /// Write recovery state to `{journal_dir}/recovery.json`.
 /// Used ONLY by hakuzu snapshot bootstrap — sealed segments use the chain hash
 /// trailer for recovery, which is atomic with the seal operation.
-pub fn write_recovery_state(journal_dir: &Path, seq: u64, hash: [u8; 32]) {
+pub fn write_recovery_state(journal_dir: &Path, seq: u64, hash: [u8; 32]) -> Result<(), std::io::Error> {
     let path = journal_dir.join(RECOVERY_FILENAME);
     let json = format!(
         r#"{{"last_seq":{},"chain_hash":"{}"}}"#,
         seq,
         hex::encode(hash)
     );
-    if let Err(e) = std::fs::write(&path, json.as_bytes()) {
-        tracing::warn!("Failed to write recovery.json: {e}");
-    }
+    std::fs::write(&path, json.as_bytes())
 }
 
 /// Try to read cached recovery state from `{journal_dir}/recovery.json`.
@@ -752,7 +769,7 @@ pub fn recover_journal_state(journal_dir: &Path) -> Result<(u64, [u8; 32]), Stri
 
     // Slow path: no segments have chain hash trailers (v1 segments).
     // Full scan is required to recompute the chain hash.
-    info!("Recovery: no chain hash trailers found, performing full O(N) scan");
+    info!("Recovery: no chain hash trailers found, falling back to full O(N) scan");
     recover_journal_state_full_scan(journal_dir)
 }
 
@@ -798,39 +815,34 @@ fn recover_journal_state_full_scan(journal_dir: &Path) -> Result<(u64, [u8; 32])
             Err(e) => return Err(format!("Failed to read {}: {e}", segment_path.display())),
         };
 
-        if let Some(ref hdr) = hdr_opt {
-            if hdr.is_sealed() && hdr.is_compressed() {
-                // Compressed segment: decode body into memory, read entries from cursor.
+        // Build the appropriate reader based on segment format.
+        let mut entry_reader: Box<dyn Read> = if let Some(ref hdr) = hdr_opt {
+            if hdr.is_sealed() && hdr.is_encrypted() {
+                // Encrypted: must decrypt entire body first, then decompress.
                 let mut body = vec![0u8; hdr.body_len as usize];
                 file.read_exact(&mut body)
-                    .map_err(|e| format!("Failed to read compressed body: {e}"))?;
+                    .map_err(|e| format!("Failed to read encrypted body: {e}"))?;
                 let raw = graphj::decode_body(hdr, &body, None)?;
-                let mut cursor = io::Cursor::new(raw);
-                loop {
-                    match read_entry_from(&mut cursor) {
-                        Ok(Some(decoded)) => {
-                            let mut hasher = Sha256::new();
-                            hasher.update(decoded.prev_hash);
-                            hasher.update(&decoded.payload);
-                            running_hash = hasher.finalize().into();
-                            last_seq = decoded.sequence;
-                        }
-                        Ok(None) => break,
-                        Err(e) => return Err(format!("Error reading journal during recovery: {e}")),
-                    }
-                }
-                continue;
+                Box::new(io::Cursor::new(raw))
+            } else if hdr.is_sealed() && hdr.is_compressed() {
+                // Compressed-only: stream via zstd decoder.
+                let take = file.take(hdr.body_len);
+                let decoder = zstd::Decoder::new(take)
+                    .map_err(|e| format!("Failed to create zstd decoder: {e}"))?;
+                Box::new(decoder)
+            } else {
+                // Unsealed or sealed-raw: read directly.
+                Box::new(BufReader::with_capacity(1024 * 1024, file))
             }
         } else {
             // Legacy .wal — seek back to 0.
             file.seek(SeekFrom::Start(0))
                 .map_err(|e| format!("Failed to seek: {e}"))?;
-        }
+            Box::new(BufReader::with_capacity(1024 * 1024, file))
+        };
 
-        // Unsealed .graphj or legacy .wal: read entries directly from file.
-        let mut reader = BufReader::new(file);
         loop {
-            match read_entry_from(&mut reader) {
+            match read_entry_from(&mut entry_reader) {
                 Ok(Some(decoded)) => {
                     let mut hasher = Sha256::new();
                     hasher.update(decoded.prev_hash);

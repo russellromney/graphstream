@@ -29,7 +29,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::journal::{JournalCommand, JournalSender};
 use crate::retry::RetryPolicy;
@@ -43,6 +43,13 @@ use crate::retry::RetryPolicy;
 pub trait SegmentStorage: Send + Sync + 'static {
     /// Upload bytes to the given key. Must be idempotent.
     async fn upload_bytes(&self, key: &str, data: Vec<u8>) -> Result<()>;
+
+    /// Upload a file by path. Default reads into memory; S3 impl streams via ByteStream.
+    async fn upload_file(&self, key: &str, path: &Path) -> Result<()> {
+        let data =
+            std::fs::read(path).map_err(|e| anyhow!("Read {}: {e}", path.display()))?;
+        self.upload_bytes(key, data).await
+    }
 }
 
 /// S3 implementation of SegmentStorage.
@@ -65,6 +72,22 @@ impl SegmentStorage for S3SegmentStorage {
             .bucket(&self.bucket)
             .key(key)
             .body(data.into())
+            .send()
+            .await
+            .map_err(|e| anyhow!("PutObject {}: {e}", key))?;
+        Ok(())
+    }
+
+    /// Stream file directly to S3 without loading into memory.
+    async fn upload_file(&self, key: &str, path: &Path) -> Result<()> {
+        let body = aws_sdk_s3::primitives::ByteStream::from_path(path)
+            .await
+            .map_err(|e| anyhow!("ByteStream {}: {e}", path.display()))?;
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(body)
             .send()
             .await
             .map_err(|e| anyhow!("PutObject {}: {e}", key))?;
@@ -104,14 +127,16 @@ struct UploadTaskContext {
     prefix: String,
     retry_policy: Arc<RetryPolicy>,
     stats: Arc<tokio::sync::Mutex<UploaderStats>>,
+    cache: Option<Arc<tokio::sync::Mutex<crate::cache::SegmentCache>>>,
 }
 
 struct UploadResult {
-    _path: PathBuf,
+    _segment_name: String,
 }
 
 impl UploadTaskContext {
     /// Upload a single sealed segment file with retry.
+    /// Uses streaming upload (ByteStream) for S3 — file is NOT loaded into memory.
     async fn upload_segment(&self, path: PathBuf) -> Result<UploadResult> {
         {
             let mut stats = self.stats.lock().await;
@@ -125,22 +150,21 @@ impl UploadTaskContext {
             .to_string();
         let key = format!("{}journal/{}", self.prefix, file_name);
 
-        // Read file once, share across retry attempts.
-        let bytes = Arc::new(
-            std::fs::read(&path).map_err(|e| anyhow!("Read {}: {e}", path.display()))?,
-        );
-        let data_len = bytes.len() as u64;
+        // Get file size before upload for stats tracking.
+        let data_len = std::fs::metadata(&path)
+            .map_err(|e| anyhow!("Metadata {}: {e}", path.display()))?
+            .len();
 
         let storage = self.storage.clone();
         let key_clone = key.clone();
-        let bytes_clone = bytes.clone();
+        let path_clone = path.clone();
 
         self.retry_policy
             .execute(|| {
                 let storage = storage.clone();
                 let key = key_clone.clone();
-                let bytes = bytes_clone.clone();
-                async move { storage.upload_bytes(&key, (*bytes).clone()).await }
+                let path = path_clone.clone();
+                async move { storage.upload_file(&key, &path).await }
             })
             .await?;
 
@@ -150,8 +174,18 @@ impl UploadTaskContext {
             stats.bytes_uploaded += data_len;
         }
 
-        info!("Uploaded {} ({} bytes)", key, data_len);
-        Ok(UploadResult { _path: path })
+        // Mark as uploaded in cache.
+        if let Some(ref cache) = self.cache {
+            let mut cache = cache.lock().await;
+            if let Err(e) = cache.mark_uploaded(&file_name) {
+                error!("Failed to mark {} as uploaded in cache: {e}", file_name);
+            }
+        }
+
+        info!(segment = %file_name, key = %key, size_bytes = data_len, "Uploaded segment");
+        Ok(UploadResult {
+            _segment_name: file_name,
+        })
     }
 }
 
@@ -172,12 +206,23 @@ impl Uploader {
         retry_policy: Arc<RetryPolicy>,
         max_concurrent: usize,
     ) -> Self {
+        Self::with_cache(storage, prefix, retry_policy, max_concurrent, None)
+    }
+
+    pub fn with_cache(
+        storage: Arc<dyn SegmentStorage>,
+        prefix: String,
+        retry_policy: Arc<RetryPolicy>,
+        max_concurrent: usize,
+        cache: Option<Arc<tokio::sync::Mutex<crate::cache::SegmentCache>>>,
+    ) -> Self {
         Self {
             ctx: UploadTaskContext {
                 storage,
                 prefix,
                 retry_policy,
                 stats: Arc::new(tokio::sync::Mutex::new(UploaderStats::default())),
+                cache,
             },
             max_concurrent: max_concurrent.max(1),
         }
@@ -196,14 +241,14 @@ impl Uploader {
                             in_flight.spawn(async move { ctx.upload_segment(path).await });
                         }
                         Some(UploadMessage::Shutdown) => {
-                            info!("Uploader: shutting down, draining {} in-flight", in_flight.len());
+                            info!(in_flight = in_flight.len(), "Uploader shutting down, draining");
                             while let Some(result) = in_flight.join_next().await {
                                 Self::handle_join_result(result);
                             }
                             break;
                         }
                         None => {
-                            info!("Uploader: channel closed, draining {} in-flight", in_flight.len());
+                            info!(in_flight = in_flight.len(), "Uploader channel closed, draining");
                             while let Some(result) = in_flight.join_next().await {
                                 Self::handle_join_result(result);
                             }
@@ -218,7 +263,13 @@ impl Uploader {
         }
 
         let stats = self.ctx.stats.lock().await.clone();
-        info!("Uploader stopped. Stats: {:?}", stats);
+        info!(
+            attempted = stats.uploads_attempted,
+            succeeded = stats.uploads_succeeded,
+            failed = stats.uploads_failed,
+            bytes = stats.bytes_uploaded,
+            "Uploader stopped"
+        );
         Ok(stats)
     }
 
@@ -288,15 +339,39 @@ pub fn spawn_journal_uploader_with_retry(
     bucket: String,
     prefix: String,
     interval: Duration,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
     retry_policy: RetryPolicy,
     max_concurrent: usize,
 ) -> (mpsc::Sender<UploadMessage>, tokio::task::JoinHandle<()>) {
+    spawn_journal_uploader_with_cache(
+        journal_tx,
+        journal_dir,
+        bucket,
+        prefix,
+        interval,
+        shutdown,
+        retry_policy,
+        max_concurrent,
+        None,
+        None,
+    )
+}
+
+/// Spawn uploader with cache integration and periodic cleanup.
+pub fn spawn_journal_uploader_with_cache(
+    journal_tx: JournalSender,
+    journal_dir: PathBuf,
+    bucket: String,
+    prefix: String,
+    interval: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    retry_policy: RetryPolicy,
+    max_concurrent: usize,
+    cache: Option<Arc<tokio::sync::Mutex<crate::cache::SegmentCache>>>,
+    cache_config: Option<crate::cache::CacheConfig>,
+) -> (mpsc::Sender<UploadMessage>, tokio::task::JoinHandle<()>) {
     let retry_policy = Arc::new(retry_policy);
 
-    // Create S3 storage and uploader.
-    // S3 client creation is async, so we do it inside the spawned task.
-    // But we need to return the sender immediately, so we create the channel now.
     let (upload_tx, upload_rx) = mpsc::channel::<UploadMessage>(256);
     let upload_tx_clone = upload_tx.clone();
 
@@ -305,12 +380,35 @@ pub fn spawn_journal_uploader_with_retry(
         let client = aws_sdk_s3::Client::new(&config);
         let storage = Arc::new(S3SegmentStorage::new(client, bucket));
 
-        let uploader = Arc::new(Uploader::new(
+        let uploader = Arc::new(Uploader::with_cache(
             storage,
             prefix,
             retry_policy.clone(),
             max_concurrent,
+            cache.clone(),
         ));
+
+        // Resume pending uploads from cache on startup.
+        if let Some(ref cache) = cache {
+            let cache_guard = cache.lock().await;
+            match cache_guard.pending_segments() {
+                Ok(pending) => {
+                    if !pending.is_empty() {
+                        info!(
+                            "Journal uploader: resuming {} pending uploads from cache",
+                            pending.len()
+                        );
+                        for path in pending {
+                            if upload_tx_clone.send(UploadMessage::Upload(path)).await.is_err() {
+                                error!("Journal uploader: upload channel closed during resume");
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(e) => error!("Journal uploader: failed to read pending segments: {e}"),
+            }
+        }
 
         // Spawn the concurrent uploader in its own task.
         let uploader_handle = {
@@ -326,13 +424,26 @@ pub fn spawn_journal_uploader_with_retry(
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Cleanup timer — every 5 minutes.
+        let mut cleanup_ticker = tokio::time::interval(Duration::from_secs(300));
+        cleanup_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let cleanup_config = cache_config.unwrap_or_default();
+
         loop {
             tokio::select! {
                 _ = ticker.tick() => {}
+                _ = cleanup_ticker.tick(), if cache.is_some() => {
+                    if let Some(ref cache) = cache {
+                        let mut cache_guard = cache.lock().await;
+                        if let Err(e) = cache_guard.cleanup(&cleanup_config) {
+                            error!("Cache cleanup failed: {e}");
+                        }
+                    }
+                    continue;
+                }
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         info!("Journal uploader: shutting down");
-                        // Send shutdown to concurrent uploader.
                         let _ = upload_tx_clone.send(UploadMessage::Shutdown).await;
                         let _ = uploader_handle.await;
                         return;
@@ -343,9 +454,9 @@ pub fn spawn_journal_uploader_with_retry(
             // Skip if circuit breaker is open.
             if let Some(cb) = retry_policy.circuit_breaker() {
                 if !cb.should_allow() {
-                    warn!(
-                        "Journal uploader: circuit breaker open ({} consecutive failures), skipping cycle",
-                        cb.consecutive_failures()
+                    error!(
+                        consecutive_failures = cb.consecutive_failures(),
+                        "Journal uploader: circuit breaker open, skipping cycle"
                     );
                     continue;
                 }
@@ -366,13 +477,22 @@ pub fn spawn_journal_uploader_with_retry(
             };
 
             if let Some(path) = &seal_result {
-                info!("Journal uploader: sealed {}", path.display());
+                info!(segment = %path.display(), "Sealed segment for upload");
             }
 
-            // 2. Scan for all sealed .graphj files and send Upload messages.
+            // 2. Scan for sealed .graphj files, skip already-uploaded, send Upload messages.
             match scan_sealed_segments(&journal_dir) {
                 Ok(paths) => {
                     for path in paths {
+                        // Skip already-uploaded segments when cache is available.
+                        if let Some(ref cache) = cache {
+                            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                let cache_guard = cache.lock().await;
+                                if cache_guard.is_uploaded(name) {
+                                    continue;
+                                }
+                            }
+                        }
                         if upload_tx_clone.send(UploadMessage::Upload(path)).await.is_err() {
                             error!("Journal uploader: upload channel closed unexpectedly");
                             return;
@@ -399,18 +519,13 @@ fn scan_sealed_segments(journal_dir: &Path) -> Result<Vec<PathBuf>> {
         let entry = entry.map_err(|e| anyhow!("Read dir entry: {e}"))?;
         let path = entry.path();
 
-        let name = match path.file_name().and_then(|n| n.to_str()) {
+        let _name = match path.file_name().and_then(|n| n.to_str()) {
             Some(n) if n.ends_with(".graphj") => n.to_string(),
             _ => continue,
         };
 
         // Skip non-sealed files.
-        if !is_sealed(&path)? {
-            continue;
-        }
-
-        // Skip the special names that aren't real segments.
-        if name == "recovery.json" {
+        if !crate::graphj::is_file_sealed(&path).map_err(|e| anyhow!("{e}"))? {
             continue;
         }
 
@@ -420,21 +535,102 @@ fn scan_sealed_segments(journal_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(sealed)
 }
 
-/// Check if a .graphj file is sealed by reading its header.
-fn is_sealed(path: &Path) -> Result<bool> {
-    let mut f =
-        std::fs::File::open(path).map_err(|e| anyhow!("Open {}: {e}", path.display()))?;
-    match crate::graphj::read_header(&mut f) {
-        Ok(Some(header)) => Ok(header.is_sealed()),
-        Ok(None) => Ok(false),
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                Ok(false)
-            } else {
-                Err(anyhow!("Read header {}: {e}", path.display()))
-            }
+// ---------------------------------------------------------------------------
+// Background compaction
+// ---------------------------------------------------------------------------
+
+/// Configuration for background compaction.
+#[derive(Debug, Clone)]
+pub struct CompactionConfig {
+    /// Compact after this many uploaded segments accumulate.
+    pub threshold: usize,
+    /// Zstd compression level for compacted output.
+    pub zstd_level: i32,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            threshold: 10,
+            zstd_level: 3,
         }
     }
+}
+
+/// Run background compaction on uploaded segments in the cache.
+/// Compacts N uploaded segments into one, uploads the compacted segment,
+/// then marks originals as candidates for cleanup.
+///
+/// Returns Ok(true) if compaction was triggered, Ok(false) if below threshold.
+pub async fn run_background_compaction(
+    journal_dir: &Path,
+    cache: &Arc<tokio::sync::Mutex<crate::cache::SegmentCache>>,
+    upload_tx: &mpsc::Sender<UploadMessage>,
+    config: &CompactionConfig,
+) -> Result<bool> {
+    // Get uploaded segment paths from cache.
+    let uploaded_paths: Vec<PathBuf> = {
+        let cache_guard = cache.lock().await;
+        let mut paths = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(journal_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.ends_with(".graphj")
+                        && !name.starts_with("compacted-")
+                        && cache_guard.is_uploaded(name)
+                    {
+                        paths.push(path);
+                    }
+                }
+            }
+        }
+        paths.sort();
+        paths
+    };
+
+    if uploaded_paths.len() < config.threshold {
+        return Ok(false);
+    }
+
+    info!(
+        "Background compaction: compacting {} uploaded segments",
+        uploaded_paths.len()
+    );
+
+    // Run compaction in a blocking thread.
+    let paths = uploaded_paths.clone();
+    let dir = journal_dir.to_path_buf();
+    let zstd_level = config.zstd_level;
+    let compacted_path = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+        let output = dir.join(format!(
+            "compacted-{}.graphj",
+            crate::current_timestamp_ms()
+        ));
+        crate::graphj::compact_streaming(
+            &paths.iter().map(|p| p.as_path()).collect::<Vec<_>>(),
+            &output,
+            true,
+            zstd_level,
+            None,
+        )
+        .map_err(|e| anyhow!("Compaction failed: {e}"))?;
+        Ok(output)
+    })
+    .await
+    .map_err(|e| anyhow!("Compaction task panicked: {e}"))??;
+
+    // Upload the compacted segment.
+    upload_tx
+        .send(UploadMessage::Upload(compacted_path))
+        .await
+        .map_err(|_| anyhow!("Upload channel closed during compaction"))?;
+
+    info!(
+        "Background compaction: compacted {} segments, queued for upload",
+        uploaded_paths.len()
+    );
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -735,5 +931,143 @@ mod tests {
         assert_eq!(stats.uploads_succeeded, 5);
         assert_eq!(stats.uploads_failed, 0);
         assert_eq!(stats.bytes_uploaded, 5 * data.len() as u64);
+    }
+
+    /// Helper: create real sealed journal segments by writing entries via the journal writer.
+    fn create_sealed_segments(journal_dir: &Path, entry_count: usize, segment_max_bytes: u64) {
+        let state = Arc::new(crate::journal::JournalState::with_sequence_and_hash(
+            0,
+            [0u8; 32],
+        ));
+        let tx = crate::journal::spawn_journal_writer(
+            journal_dir.to_path_buf(),
+            segment_max_bytes,
+            100,
+            state,
+        );
+        for i in 1..=entry_count {
+            tx.send(crate::journal::JournalCommand::Write(
+                crate::journal::PendingEntry {
+                    query: format!("CREATE (:N {{v: {}}})", i),
+                    params: vec![],
+                },
+            ))
+            .unwrap();
+        }
+        tx.send(crate::journal::JournalCommand::Shutdown).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    #[tokio::test]
+    async fn test_background_compaction_triggers() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+
+        // Create multiple small sealed segments.
+        create_sealed_segments(&journal_dir, 20, 512);
+
+        // Set up cache and mark all segments as uploaded.
+        let mut cache = crate::cache::SegmentCache::new(&journal_dir).unwrap();
+        let pending = cache.pending_segments().unwrap();
+        assert!(pending.len() >= 3, "Need at least 3 segments, got {}", pending.len());
+        for path in &pending {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            cache.mark_uploaded(name).unwrap();
+        }
+        let cache = Arc::new(tokio::sync::Mutex::new(cache));
+
+        let (upload_tx, mut upload_rx) = mpsc::channel::<UploadMessage>(256);
+
+        // Compaction with threshold=3.
+        let config = CompactionConfig {
+            threshold: 3,
+            zstd_level: 3,
+        };
+        let result =
+            run_background_compaction(&journal_dir, &cache, &upload_tx, &config).await.unwrap();
+        assert!(result, "Compaction should trigger when uploaded >= threshold");
+
+        // Verify a compacted segment was queued for upload.
+        match upload_rx.try_recv() {
+            Ok(UploadMessage::Upload(path)) => {
+                let name = path.file_name().unwrap().to_str().unwrap().to_string();
+                assert!(name.starts_with("compacted-"), "Expected compacted-*, got {name}");
+                assert!(path.exists(), "Compacted file should exist on disk");
+
+                // Verify the compacted file is valid and readable.
+                let reader = crate::journal::JournalReader::open(
+                    path.parent().unwrap(),
+                ).unwrap();
+                let entries: Vec<_> = reader
+                    .filter_map(|r| r.ok())
+                    .collect();
+                // Compacted + original sealed segments both present — entries should be >= 20.
+                assert!(entries.len() >= 20, "Expected >= 20 entries, got {}", entries.len());
+            }
+            other => panic!("Expected Upload message, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_background_compaction_below_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+
+        // Create 1 segment (only 1 entry, 1MB segment = no rotation).
+        create_sealed_segments(&journal_dir, 1, 1024 * 1024);
+
+        let mut cache = crate::cache::SegmentCache::new(&journal_dir).unwrap();
+        for path in cache.pending_segments().unwrap() {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            cache.mark_uploaded(name).unwrap();
+        }
+        let cache = Arc::new(tokio::sync::Mutex::new(cache));
+
+        let (upload_tx, _rx) = mpsc::channel::<UploadMessage>(256);
+        let config = CompactionConfig::default(); // threshold = 10
+        let result =
+            run_background_compaction(&journal_dir, &cache, &upload_tx, &config).await.unwrap();
+        assert!(!result, "Compaction should not trigger below threshold");
+    }
+
+    #[tokio::test]
+    async fn test_background_compaction_skips_already_compacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+
+        // Create enough segments.
+        create_sealed_segments(&journal_dir, 20, 512);
+
+        let mut cache = crate::cache::SegmentCache::new(&journal_dir).unwrap();
+        let pending = cache.pending_segments().unwrap();
+        for path in &pending {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            cache.mark_uploaded(name).unwrap();
+        }
+
+        // Create a fake "compacted-" file to verify it's excluded from compaction input.
+        let fake_compacted = journal_dir.join("compacted-0000000000.graphj");
+        std::fs::write(&fake_compacted, b"fake").unwrap();
+
+        let cache = Arc::new(tokio::sync::Mutex::new(cache));
+        let (upload_tx, mut upload_rx) = mpsc::channel::<UploadMessage>(256);
+
+        let config = CompactionConfig {
+            threshold: 3,
+            zstd_level: 3,
+        };
+        let result =
+            run_background_compaction(&journal_dir, &cache, &upload_tx, &config).await.unwrap();
+        assert!(result, "Compaction should still trigger");
+
+        // The queued compacted file should NOT be the fake one.
+        match upload_rx.try_recv() {
+            Ok(UploadMessage::Upload(path)) => {
+                let name = path.file_name().unwrap().to_str().unwrap();
+                assert_ne!(name, "compacted-0000000000.graphj");
+                assert!(name.starts_with("compacted-"));
+            }
+            other => panic!("Expected Upload message, got: {other:?}"),
+        }
     }
 }

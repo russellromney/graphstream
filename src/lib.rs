@@ -9,8 +9,10 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod cache;
 pub mod graphj;
 pub mod journal;
+pub mod metrics;
 pub mod retry;
 pub mod sync;
 pub mod types;
@@ -39,8 +41,11 @@ pub use types::{
     graph_value_to_param_value, map_entries_to_param_values, param_value_to_graph_value,
     param_values_to_map_entries, ParamValue,
 };
+pub use cache::{CacheConfig, CacheStats, CleanupStats, SegmentCache};
+pub use metrics::GraphstreamMetrics;
 pub use retry::{RetryConfig, RetryPolicy};
 pub use uploader::{
-    spawn_journal_uploader, spawn_journal_uploader_with_retry, spawn_uploader, SegmentStorage,
+    run_background_compaction, spawn_journal_uploader, spawn_journal_uploader_with_cache,
+    spawn_journal_uploader_with_retry, spawn_uploader, CompactionConfig, SegmentStorage,
     S3SegmentStorage, UploadMessage, Uploader, UploaderStats,
 };

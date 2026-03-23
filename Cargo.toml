@@ -32,8 +32,9 @@ tokio = { version = "1", features = ["full"] }
 # Logging
 tracing = "0.1"
 
-# Serialization (for ParamValue)
+# Serialization (for ParamValue + cache manifest)
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Error handling
 anyhow = "1"
@@ -52,3 +53,4 @@ tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 uuid = { version = "1", features = ["v4"] }
 hex = "0.4"
+filetime = "0.2"

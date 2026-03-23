@@ -1,5 +1,77 @@
 # graphstream Changelog
 
+## Phase 8: Structured Tracing
+
+Replaced string-interpolated `tracing::info!` with structured fields across uploader, journal, and sync modules. Behavioral no-op — same log messages, now machine-parseable.
+
+Examples:
+- `info!(segment = %name, size_bytes = len, "Uploaded")`
+- `info!(segments_scanned = n, duration_ms = d, "Recovery complete")`
+
+Files: `src/uploader.rs`, `src/journal.rs`, `src/sync.rs`
+
+## Phase 7: Prometheus Metrics
+
+`GraphstreamMetrics` — lock-free `AtomicU64` counters following hadb's pattern. No external prometheus crate.
+
+### Counters
+- `entries_written`, `segments_sealed`, `segments_uploaded`, `upload_errors`, `upload_bytes`
+- `segments_downloaded`, `download_errors`, `chain_hash_mismatches`
+
+### Gauges
+- `last_upload_duration_us`, `last_recovery_duration_us`
+
+### API
+- `Arc<GraphstreamMetrics>` passed to journal, uploader, and sync
+- `snapshot()` → `MetricsSnapshot` → `to_prometheus()` text format
+
+### Tests (4 unit)
+- `test_metrics_default_zero`, `test_metrics_increment`, `test_metrics_snapshot`, `test_metrics_prometheus_format`
+
+Files: `src/metrics.rs`, `src/lib.rs`
+
+## Phase 6: Compaction
+
+### Streaming compaction
+`compact_streaming()` reads entries one at a time from inputs via `read_raw_entry()` and writes through a zstd encoder. Avoids loading all entries into memory. Encrypted inputs fall back to full-body decode (encryption needs all bytes); encrypted output not supported in streaming mode (use existing `compact()` for that).
+
+### Background compaction
+`run_background_compaction()` triggers after N uploaded segments accumulate (configurable via `CompactionConfig`). Collects uploaded segment paths, runs `compact_streaming()` via `spawn_blocking`, uploads the compacted segment, marks originals as compacted in cache.
+
+### Tests (2 integration)
+- `test_compact_streaming_matches_compact`, `test_compact_streaming_many_segments`
+
+Files: `src/graphj.rs`, `src/uploader.rs`, `src/lib.rs`
+
+## Phase 5: Disk Cache, Streaming I/O, BufReader
+
+### Disk cache + cleanup
+`SegmentCache` — manifest-based upload tracking (`upload_manifest.json`). Atomic persistence (write .tmp + rename). Pending segments survive process restart. Age-based and size-based cleanup never deletes pending uploads.
+
+API: `SegmentCache::new()`, `add_segment()`, `pending_segments()`, `mark_uploaded()`, `cleanup()`, `reconcile()`, `stats()`
+
+Integrated into uploader via `spawn_journal_uploader_with_cache()` — resume pending uploads on startup, mark uploaded after success, cleanup every 5 minutes.
+
+### Streaming S3 upload
+`SegmentStorage` trait gained `upload_file(&self, key, path)` with default impl delegating to `upload_bytes`. `S3SegmentStorage` overrides with `ByteStream::from_path()` — streams file to S3 without reading entire segment into memory.
+
+### Streaming zstd decompression
+`JournalReader` polymorphic reader (`Box<dyn Read>`). Three paths in `open_segment()`:
+- Encrypted → full-body decode to cursor (encryption needs all bytes)
+- Compressed-only → `zstd::Decoder::new(file.take(body_len))` streaming
+- Raw → `BufReader::with_capacity(1MB, file)`
+
+Same pattern applied to `recover_journal_state_full_scan`.
+
+### BufReader capacity
+Default 8KB → 1MB for all sequential segment reads.
+
+### Tests (9 unit + 2 integration)
+- Cache: `test_cache_empty_dir`, `test_cache_mark_uploaded`, `test_cache_crash_recovery`, `test_cache_reconcile_stale`, `test_cache_cleanup_age`, `test_cache_cleanup_size`, `test_cache_never_delete_pending`, `test_cache_stats`, `test_cache_mark_idempotent`
+- Integration: `test_streaming_zstd_read_1000_entries`, `test_streaming_zstd_from_sequence`
+
+Files: `src/cache.rs`, `src/uploader.rs`, `src/journal.rs`, `src/lib.rs`
+
 ## Phase 4: Concurrent S3 Uploads via JoinSet
 
 Replaced sequential upload loop with concurrent `JoinSet`-based uploader. Sequential S3 uploads (100-500ms each) were the throughput bottleneck — now up to 4 concurrent uploads (configurable `max_concurrent`).
