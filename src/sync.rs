@@ -4,13 +4,19 @@
 //! fetch journal segments. The caller (hakuzu or graphd) handles replay.
 
 use std::path::{Path, PathBuf};
+
+use anyhow::anyhow;
 use tracing::debug;
+
+use crate::retry::RetryPolicy;
 
 /// Download journal segments from S3 that are newer than `since_seq`.
 /// Returns `Vec<(local_path, seq)>` of downloaded segments, sorted by seq ascending.
 ///
 /// Includes the "straddling" segment — the last segment whose first_seq is at or before
 /// `since_seq`, because it may contain entries after `since_seq`.
+///
+/// Uses default retry policy. For custom retry, use `download_new_segments_with_retry`.
 pub async fn download_new_segments(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -18,8 +24,24 @@ pub async fn download_new_segments(
     journal_dir: &Path,
     since_seq: u64,
 ) -> Result<Vec<(PathBuf, u64)>, String> {
-    // List all journal segments from S3.
-    let segments = list_journal_segments_s3(s3_client, bucket, prefix, since_seq).await?;
+    let policy = RetryPolicy::default_policy();
+    download_new_segments_with_retry(s3_client, bucket, prefix, journal_dir, since_seq, &policy)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Download journal segments from S3 with a custom retry policy.
+pub async fn download_new_segments_with_retry(
+    s3_client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    journal_dir: &Path,
+    since_seq: u64,
+    retry_policy: &RetryPolicy,
+) -> anyhow::Result<Vec<(PathBuf, u64)>> {
+    // List all journal segments from S3 (with retry).
+    let segments =
+        list_journal_segments_s3(s3_client, bucket, prefix, since_seq, retry_policy).await?;
 
     if segments.is_empty() {
         return Ok(Vec::new());
@@ -27,13 +49,20 @@ pub async fn download_new_segments(
 
     // Ensure journal dir exists.
     std::fs::create_dir_all(journal_dir)
-        .map_err(|e| format!("Failed to create journal dir: {e}"))?;
+        .map_err(|e| anyhow!("Failed to create journal dir: {e}"))?;
 
     let mut downloaded = Vec::new();
 
     for (s3_key, seq) in &segments {
-        let local_path =
-            download_single_segment_s3(s3_client, bucket, s3_key, *seq, journal_dir).await?;
+        let local_path = download_single_segment_s3(
+            s3_client,
+            bucket,
+            s3_key,
+            *seq,
+            journal_dir,
+            retry_policy,
+        )
+        .await?;
         downloaded.push((local_path, *seq));
     }
 
@@ -50,24 +79,36 @@ async fn list_journal_segments_s3(
     bucket: &str,
     prefix: &str,
     since_seq: u64,
-) -> Result<Vec<(String, u64)>, String> {
+    retry_policy: &RetryPolicy,
+) -> anyhow::Result<Vec<(String, u64)>> {
     let journal_prefix = if prefix.is_empty() {
         "journal/".to_string()
     } else {
         format!("{}journal/", prefix)
     };
 
-    let list_resp = s3_client
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix(&journal_prefix)
-        .send()
-        .await
-        .map_err(|e| format!("S3 list journal failed: {e}"))?;
+    let client = s3_client.clone();
+    let bucket = bucket.to_string();
+    let journal_prefix_clone = journal_prefix.clone();
+
+    let list_resp = retry_policy
+        .execute(|| {
+            let client = client.clone();
+            let bucket = bucket.clone();
+            let prefix = journal_prefix_clone.clone();
+            async move {
+                client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix(&prefix)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow!("S3 list journal failed: {e}"))
+            }
+        })
+        .await?;
 
     let mut segments: Vec<(String, u64)> = Vec::new();
-    // Track the last segment that starts at or before since_seq —
-    // it may straddle the boundary and contain entries > since_seq.
     let mut last_before: Option<(String, u64)> = None;
 
     for obj in list_resp.contents() {
@@ -99,27 +140,43 @@ async fn download_single_segment_s3(
     key: &str,
     seq: u64,
     journal_dir: &Path,
-) -> Result<PathBuf, String> {
-    let get_resp = s3_client
-        .get_object()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await
-        .map_err(|e| format!("S3 get journal segment failed: {e}"))?;
+    retry_policy: &RetryPolicy,
+) -> anyhow::Result<PathBuf> {
+    let client = s3_client.clone();
+    let bucket = bucket.to_string();
+    let key = key.to_string();
 
-    let segment_bytes = get_resp
-        .body
-        .collect()
-        .await
-        .map_err(|e| format!("S3 read segment failed: {e}"))?
-        .into_bytes();
+    let segment_bytes = retry_policy
+        .execute(|| {
+            let client = client.clone();
+            let bucket = bucket.clone();
+            let key = key.clone();
+            async move {
+                let get_resp = client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow!("S3 get journal segment failed: {e}"))?;
+
+                let bytes = get_resp
+                    .body
+                    .collect()
+                    .await
+                    .map_err(|e| anyhow!("S3 read segment body failed: {e}"))?
+                    .into_bytes();
+
+                Ok(bytes)
+            }
+        })
+        .await?;
 
     let local_filename = format!("journal-{:016}.graphj", seq);
     let local_path = journal_dir.join(&local_filename);
 
     std::fs::write(&local_path, &segment_bytes)
-        .map_err(|e| format!("Write journal segment failed: {e}"))?;
+        .map_err(|e| anyhow!("Write journal segment failed: {e}"))?;
 
     debug!("Downloaded segment to {}", local_path.display());
     Ok(local_path)

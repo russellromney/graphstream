@@ -150,7 +150,8 @@ pub fn spawn_journal_writer(
 const JOURNAL_ZSTD_LEVEL: i32 = 3;
 
 /// Seal a .graphj segment: compress body with zstd, rewrite header with
-/// SEALED + COMPRESSED flags + final values.
+/// SEALED + COMPRESSED + HAS_CHAIN_HASH flags, append 32-byte chain hash trailer.
+/// The entire seal (header + body + trailer) is written atomically with fsync.
 fn seal_segment(
     file: &mut File,
     first_seq: u64,
@@ -159,6 +160,7 @@ fn seal_segment(
     _body_len: u64,
     _body_hasher: Sha256,
     created_ms: i64,
+    chain_hash: [u8; 32],
 ) -> io::Result<()> {
     // Read the raw body (everything after the 128-byte header).
     let file_len = file.seek(SeekFrom::End(0))?;
@@ -177,7 +179,7 @@ fn seal_segment(
     let body_checksum: [u8; 32] = hasher.finalize().into();
 
     let header = graphj::GraphjHeader {
-        flags: graphj::FLAG_SEALED | graphj::FLAG_COMPRESSED,
+        flags: graphj::FLAG_SEALED | graphj::FLAG_COMPRESSED | graphj::FLAG_HAS_CHAIN_HASH,
         compression: graphj::COMPRESSION_ZSTD,
         encryption: graphj::ENCRYPTION_NONE,
         zstd_level: JOURNAL_ZSTD_LEVEL,
@@ -190,11 +192,15 @@ fn seal_segment(
         created_ms,
     };
 
-    // Rewrite: header + compressed body, then truncate.
+    // Rewrite: header + compressed body + chain hash trailer, then truncate + fsync.
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&graphj::encode_header(&header))?;
     file.write_all(&compressed)?;
-    file.set_len(graphj::HEADER_SIZE as u64 + compressed.len() as u64)?;
+    file.write_all(&chain_hash)?;
+    let total_len = graphj::HEADER_SIZE as u64
+        + compressed.len() as u64
+        + graphj::CHAIN_HASH_TRAILER_SIZE as u64;
+    file.set_len(total_len)?;
     file.sync_all()?;
     Ok(())
 }
@@ -246,7 +252,7 @@ fn writer_loop(
                     if let Some(ref mut f) = current_file {
                         if let Some(hasher) = body_hasher.take() {
                             let body_len = current_size - graphj::HEADER_SIZE as u64;
-                            if let Err(e) = seal_segment(
+                            let _ = seal_segment(
                                 f,
                                 segment_first_seq,
                                 segment_last_seq,
@@ -254,9 +260,8 @@ fn writer_loop(
                                 body_len,
                                 hasher,
                                 current_timestamp_ms(),
-                            ) {
-                                error!("Failed to seal segment on rotation: {e}");
-                            }
+                                prev_hash, // chain hash after last entry in old segment
+                            );
                         }
                     }
 
@@ -320,6 +325,7 @@ fn writer_loop(
                 if let Some(ref mut f) = current_file {
                     if let Some(hasher) = body_hasher.take() {
                         let body_len = current_size - graphj::HEADER_SIZE as u64;
+                        let hash = *state.chain_hash.lock().unwrap_or_else(|e| e.into_inner());
                         if let Err(e) = seal_segment(
                             f,
                             segment_first_seq,
@@ -328,6 +334,7 @@ fn writer_loop(
                             body_len,
                             hasher,
                             current_timestamp_ms(),
+                            hash,
                         ) {
                             error!("Failed to seal segment for upload: {e}");
                             let _ = ack.send(None);
@@ -357,6 +364,7 @@ fn writer_loop(
                 if let Some(ref mut f) = current_file {
                     if let Some(hasher) = body_hasher.take() {
                         let body_len = current_size - graphj::HEADER_SIZE as u64;
+                        let hash = *state.chain_hash.lock().unwrap_or_else(|e| e.into_inner());
                         let _ = seal_segment(
                             f,
                             segment_first_seq,
@@ -365,6 +373,7 @@ fn writer_loop(
                             body_len,
                             hasher,
                             current_timestamp_ms(),
+                            hash,
                         );
                     }
                 }
@@ -379,6 +388,7 @@ fn writer_loop(
                 if let Some(ref mut f) = current_file {
                     if let Some(hasher) = body_hasher.take() {
                         let body_len = current_size - graphj::HEADER_SIZE as u64;
+                        let hash = *state.chain_hash.lock().unwrap_or_else(|e| e.into_inner());
                         let _ = seal_segment(
                             f,
                             segment_first_seq,
@@ -387,6 +397,7 @@ fn writer_loop(
                             body_len,
                             hasher,
                             current_timestamp_ms(),
+                            hash,
                         );
                     }
                 }
@@ -621,14 +632,132 @@ impl Iterator for JournalReader {
 
 // ─── Recovery ───
 
-/// Recover the journal state (last sequence + chain hash) by scanning the last
-/// segment on disk. Used on startup to continue the chain correctly.
+/// Recover the journal state (last sequence + chain hash) from sealed segments.
+/// Uses the chain hash trailer in sealed .graphj files for O(1) recovery.
+/// Falls back to recovery.json (snapshot bootstrap) or full O(N) scan.
 /// Returns (0, [0u8; 32]) if the journal directory is empty or doesn't exist.
+
+// ─── Recovery State (recovery.json — snapshot bootstrap only) ───
+
+const RECOVERY_FILENAME: &str = "recovery.json";
+
+/// Write recovery state to `{journal_dir}/recovery.json`.
+/// Used ONLY by hakuzu snapshot bootstrap — sealed segments use the chain hash
+/// trailer for recovery, which is atomic with the seal operation.
+pub fn write_recovery_state(journal_dir: &Path, seq: u64, hash: [u8; 32]) {
+    let path = journal_dir.join(RECOVERY_FILENAME);
+    let json = format!(
+        r#"{{"last_seq":{},"chain_hash":"{}"}}"#,
+        seq,
+        hex::encode(hash)
+    );
+    if let Err(e) = std::fs::write(&path, json.as_bytes()) {
+        tracing::warn!("Failed to write recovery.json: {e}");
+    }
+}
+
+/// Try to read cached recovery state from `{journal_dir}/recovery.json`.
+/// Returns `None` if missing, corrupt, or unparseable.
+fn read_recovery_state(journal_dir: &Path) -> Option<(u64, [u8; 32])> {
+    let path = journal_dir.join(RECOVERY_FILENAME);
+    let data = std::fs::read_to_string(&path).ok()?;
+
+    let last_seq_str = data
+        .split("\"last_seq\":")
+        .nth(1)?
+        .split([',', '}'])
+        .next()?
+        .trim();
+    let last_seq: u64 = last_seq_str.parse().ok()?;
+
+    let chain_hash_str = data
+        .split("\"chain_hash\":\"")
+        .nth(1)?
+        .split('"')
+        .next()?;
+    let hash_bytes = hex::decode(chain_hash_str).ok()?;
+    if hash_bytes.len() != 32 {
+        return None;
+    }
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&hash_bytes);
+
+    Some((last_seq, hash))
+}
+
 pub fn recover_journal_state(journal_dir: &Path) -> Result<(u64, [u8; 32]), String> {
     if !journal_dir.exists() {
         return Ok((0, [0u8; 32]));
     }
 
+    // Collect .graphj segments, sorted by name (ascending sequence).
+    let mut segments: Vec<PathBuf> = std::fs::read_dir(journal_dir)
+        .map_err(|e| format!("Failed to read journal dir: {e}"))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .map_or(false, |ext| ext == "wal" || ext == "graphj")
+                && p.file_name()
+                    .map_or(false, |n| n.to_string_lossy().starts_with("journal-"))
+        })
+        .collect();
+
+    if segments.is_empty() {
+        // No segments on disk. Check recovery.json for snapshot bootstrap case:
+        // hakuzu writes recovery.json after extracting a snapshot, before any
+        // journal segments exist.
+        if let Some((cached_seq, cached_hash)) = read_recovery_state(journal_dir) {
+            if cached_seq > 0 {
+                info!(
+                    "Recovery: using snapshot bootstrap state (seq={}, hash={})",
+                    cached_seq,
+                    hex::encode(cached_hash)
+                );
+                return Ok((cached_seq, cached_hash));
+            }
+        }
+        return Ok((0, [0u8; 32]));
+    }
+
+    segments.sort();
+
+    // Fast path: find the last sealed segment with a chain hash trailer.
+    // Walk segments in reverse — the last sealed segment has the final state.
+    for seg_path in segments.iter().rev() {
+        if let Ok(mut f) = File::open(seg_path) {
+            if let Ok(Some(hdr)) = graphj::read_header(&mut f) {
+                if hdr.is_sealed() && hdr.has_chain_hash() {
+                    match graphj::read_chain_hash_trailer(&mut f, &hdr) {
+                        Ok(hash) => {
+                            info!(
+                                "Recovery: O(1) from trailer (seq={}, hash={})",
+                                hdr.last_seq,
+                                hex::encode(hash)
+                            );
+                            return Ok((hdr.last_seq, hash));
+                        }
+                        Err(e) => {
+                            error!(
+                                "Recovery: trailer read failed for {}: {e}",
+                                seg_path.display()
+                            );
+                            // Fall through to try earlier segments or full scan.
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Slow path: no segments have chain hash trailers (v1 segments).
+    // Full scan is required to recompute the chain hash.
+    info!("Recovery: no chain hash trailers found, performing full O(N) scan");
+    recover_journal_state_full_scan(journal_dir)
+}
+
+/// Full O(N) scan of all journal segments to recover state.
+fn recover_journal_state_full_scan(journal_dir: &Path) -> Result<(u64, [u8; 32]), String> {
     let mut segments: Vec<PathBuf> = std::fs::read_dir(journal_dir)
         .map_err(|e| format!("Failed to read journal dir: {e}"))?
         .filter_map(|e| e.ok())

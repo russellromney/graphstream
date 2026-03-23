@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod graphj;
 pub mod journal;
+pub mod retry;
 pub mod sync;
 pub mod types;
 pub mod uploader;
@@ -30,12 +31,13 @@ pub fn current_timestamp_ms() -> i64 {
 
 // Re-exports for convenience.
 pub use journal::{
-    spawn_journal_writer, JournalCommand, JournalReader, JournalReaderEntry, JournalSender,
-    JournalState, PendingEntry,
+    recover_journal_state, spawn_journal_writer, write_recovery_state, JournalCommand,
+    JournalReader, JournalReaderEntry, JournalSender, JournalState, PendingEntry,
 };
 pub use sync::download_new_segments;
 pub use types::{
     graph_value_to_param_value, map_entries_to_param_values, param_value_to_graph_value,
     param_values_to_map_entries, ParamValue,
 };
-pub use uploader::spawn_journal_uploader;
+pub use retry::{RetryConfig, RetryPolicy};
+pub use uploader::{spawn_journal_uploader, spawn_journal_uploader_with_retry};

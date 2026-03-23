@@ -35,6 +35,12 @@ tracing = "0.1"
 # Serialization (for ParamValue)
 serde = { version = "1", features = ["derive"] }
 
+# Error handling
+anyhow = "1"
+
+# Hex encoding (for recovery.json chain hash)
+hex = "0.4"
+
 [build-dependencies]
 prost-build = "0.13"
 
@@ -42,3 +48,4 @@ prost-build = "0.13"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 uuid = { version = "1", features = ["v4"] }
+hex = "0.4"

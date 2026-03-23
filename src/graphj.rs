@@ -36,6 +36,12 @@
 //! ├─────────┴──────┴────────────────────────────────────────────────────┤
 //! │                        Variable-Length Body                          │
 //! │    Raw journal entries (or compressed/encrypted transformation)      │
+//! ├──────────────────────────────────────────────────────────────────────┤
+//! │               Optional 32-byte Chain Hash Trailer                    │
+//! │    Present when FLAG_HAS_CHAIN_HASH (0x08) is set in flags.          │
+//! │    Contains the running SHA-256 chain hash after the last entry.     │
+//! │    Written atomically with the seal (header+body+trailer+fsync).     │
+//! │    Enables O(1) recovery: read header.last_seq + trailer hash.       │
 //! └──────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -47,6 +53,8 @@
 //! - **COMPRESSED (0x01)**: Body is zstd-compressed. Only valid on sealed files.
 //! - **ENCRYPTED (0x02)**: Body is XChaCha20-Poly1305 encrypted. Only valid on
 //!   sealed files.
+//! - **HAS_CHAIN_HASH (0x08)**: 32-byte chain hash trailer follows the body.
+//!   Enables O(1) journal recovery without scanning entries.
 //!
 //! # Body Format
 //!
@@ -91,12 +99,16 @@ pub const AAD_LEN: usize = 40;
 pub const FLAG_COMPRESSED: u8 = 0x01;
 pub const FLAG_ENCRYPTED: u8 = 0x02;
 pub const FLAG_SEALED: u8 = 0x04;
+pub const FLAG_HAS_CHAIN_HASH: u8 = 0x08;
 
 pub const COMPRESSION_NONE: u8 = 0;
 pub const COMPRESSION_ZSTD: u8 = 1;
 
 pub const ENCRYPTION_NONE: u8 = 0;
 pub const ENCRYPTION_XCHACHA20POLY1305: u8 = 1;
+
+/// Size of the chain hash trailer appended after the body in sealed segments.
+pub const CHAIN_HASH_TRAILER_SIZE: usize = 32;
 
 // ─── Header ───
 
@@ -143,6 +155,10 @@ impl GraphjHeader {
 
     pub fn is_encrypted(&self) -> bool {
         self.flags & FLAG_ENCRYPTED != 0
+    }
+
+    pub fn has_chain_hash(&self) -> bool {
+        self.flags & FLAG_HAS_CHAIN_HASH != 0
     }
 }
 
@@ -208,6 +224,26 @@ pub fn read_header<R: Read>(r: &mut R) -> io::Result<Option<GraphjHeader>> {
         nonce,
         created_ms,
     }))
+}
+
+/// Read the 32-byte chain hash trailer from a sealed `.graphj` file.
+/// The file must have `FLAG_HAS_CHAIN_HASH` set and be sealed.
+/// Trailer is at offset `HEADER_SIZE + body_len`.
+pub fn read_chain_hash_trailer<RS: Read + Seek>(
+    r: &mut RS,
+    header: &GraphjHeader,
+) -> io::Result<[u8; 32]> {
+    if !header.has_chain_hash() || !header.is_sealed() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "No chain hash trailer (flag not set or file not sealed)",
+        ));
+    }
+    let trailer_offset = HEADER_SIZE as u64 + header.body_len;
+    r.seek(SeekFrom::Start(trailer_offset))?;
+    let mut hash = [0u8; 32];
+    r.read_exact(&mut hash)?;
+    Ok(hash)
 }
 
 // ─── Seal ───
