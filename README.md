@@ -1,5 +1,7 @@
 # graphstream
 
+> **Experimental.** graphstream is under active development and not yet stable. APIs will change without notice.
+
 Journal replication engine for graph databases. Logical WAL shipping via `.graphj` segments to S3.
 
 graphstream provides the replication primitives for graph database HA. It handles journal writing, segment rotation, S3 upload/download, compaction, and segment replay — the "WAL shipping" layer for Kuzu/LadybugDB.
