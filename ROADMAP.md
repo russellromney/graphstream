@@ -55,36 +55,44 @@ Source: `hadb-io/src/webhook.rs`, `hadb-io/src/retention.rs`
 
 ### Aether-e: Update Cargo.toml + tests
 
-- Add `hadb-io` dependency (path = "../hadb/hadb-io")
+- Add `hadb-io` dependency (path = "../../hadb/hadb-io")
 - Remove direct `rand` dependency (comes via hadb-io)
-- All 77 existing tests must pass unchanged (behavioral no-op)
+- Remove direct `aws-sdk-s3` and `aws-config` deps if no longer used directly
+- All existing tests must pass unchanged (behavioral no-op)
 - Add ~4 tests: ObjectStore mock upload/download, ConcurrentUploader segment flow
+
+### Implementation context for a new session
+
+**Ecosystem context:** graphstream is the journal replication engine for graph databases (Kuzu/LadybugDB). It handles journal writing, segment rotation, S3 upload, compaction, and segment replay. hakuzu depends on graphstream for follower replication. hadb-io provides shared infrastructure (S3 client, retry, concurrent uploads) that walrust already migrated to.
+
+**What walrust did (reference pattern):** walrust Phase 1b deleted ~4,275 lines and replaced direct S3 calls + custom retry with hadb-io. The migration is at `personal-website/walrust/crates/walrust-core/`. Key files: `src/sync.rs` (uses `hadb_io::ObjectStore`), `src/replicator.rs` (uses `hadb_io::S3Backend`).
+
+**Current graphstream state:** 93 tests passing (49 unit + 8 integration + 9 cache + 23 compaction + 4 doc). Phase Drain is done (`UploadWithAck` already in uploader.rs).
+
+**Key risk:** Aether-b changes `download_new_segments()` signature from `(&aws_sdk_s3::Client, &str, ...)` to `(&dyn ObjectStore, ...)`. This breaks hakuzu's `KuzuFollowerBehavior` which calls it directly. hakuzu Phase Cascade must follow immediately.
+
+**Execution order:** Aether-a first (retry.rs deletion, mechanical replacement). Then Aether-b (ObjectStore). Then Aether-c (ConcurrentUploader, optional -- can be deferred if complex). Then Aether-d (webhook/retention wiring, optional). Then Aether-e (cleanup + tests).
+
+**hadb-io public API (what you're replacing with):**
+- `hadb_io::RetryPolicy` -- drop-in for graphstream's RetryPolicy
+- `hadb_io::CircuitBreaker` -- drop-in, has `consecutive_failures()` helper
+- `hadb_io::ObjectStore` trait -- `upload_bytes`, `upload_file`, `download_bytes`, `download_file`, `list_objects`, `exists`, `delete_object`
+- `hadb_io::S3Backend` -- `S3Backend::new(client, bucket)` implements ObjectStore
+- `hadb_io::ConcurrentUploader<T: UploadItem>` -- generic concurrent upload with JoinSet
+
+**Files to read first:**
+- `hadb/hadb-io/src/retry.rs` -- the replacement RetryPolicy
+- `hadb/hadb-io/src/storage.rs` -- ObjectStore trait definition
+- `hadb/hadb-io/src/s3.rs` -- S3Backend implementation
+- `graphstream/src/retry.rs` -- what you're deleting (~679 lines)
+- `graphstream/src/uploader.rs` -- S3SegmentStorage + Uploader (UploadWithAck already there)
+- `graphstream/src/sync.rs` -- download_new_segments with direct S3 calls
 
 ---
 
-## Phase Drain: Synchronous Upload Ack for Graceful Shutdown
+## Phase Drain: Synchronous Upload Ack for Graceful Shutdown (DONE)
 
-> After: Phase Aether · Before: (none)
-
-`KuzuReplicator::sync()` (`hakuzu/src/replicator.rs:193-217`) seals the current journal segment and enqueues it for upload, but does not wait for the S3 upload to complete. The upload channel is fire-and-forget. This means `close()` in hakuzu cannot guarantee the sealed segment is in S3 before releasing the lease.
-
-### Drain-a: Add upload ack to UploadMessage
-
-Add an `UploadWithAck(PathBuf, oneshot::Sender<Result<()>>)` variant to `UploadMessage`. The uploader completes the upload and sends the result back via the oneshot channel.
-
-Source: `graphstream/src/uploader.rs` (UploadMessage enum, upload loop)
-
-### Drain-b: Wire into KuzuReplicator::sync()
-
-After `upload_tx.send(UploadWithAck(path, ack_tx))`, await the ack receiver. `sync()` now blocks until S3 has the segment.
-
-Source: `hakuzu/src/replicator.rs:207-212` (replace fire-and-forget send with ack)
-
-### Drain-c: Tests
-
-- sync() waits for upload completion before returning
-- sync() returns error if upload fails
-- sync() is idempotent (no pending segment = no-op, already handled)
+`UploadWithAck(PathBuf, oneshot::Sender<Result<()>>)` variant added to `UploadMessage`. hakuzu's `KuzuReplicator::sync()` now awaits the oneshot response instead of fire-and-forget. 3 tests (success ack, failure ack, mixed with fire-and-forget).
 
 ### Verification
 
