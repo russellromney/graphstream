@@ -60,6 +60,32 @@ Source: `hadb-io/src/webhook.rs`, `hadb-io/src/retention.rs`
 - All 77 existing tests must pass unchanged (behavioral no-op)
 - Add ~4 tests: ObjectStore mock upload/download, ConcurrentUploader segment flow
 
+---
+
+## Phase Drain: Synchronous Upload Ack for Graceful Shutdown
+
+> After: Phase Aether · Before: (none)
+
+`KuzuReplicator::sync()` (`hakuzu/src/replicator.rs:193-217`) seals the current journal segment and enqueues it for upload, but does not wait for the S3 upload to complete. The upload channel is fire-and-forget. This means `close()` in hakuzu cannot guarantee the sealed segment is in S3 before releasing the lease.
+
+### Drain-a: Add upload ack to UploadMessage
+
+Add an `UploadWithAck(PathBuf, oneshot::Sender<Result<()>>)` variant to `UploadMessage`. The uploader completes the upload and sends the result back via the oneshot channel.
+
+Source: `graphstream/src/uploader.rs` (UploadMessage enum, upload loop)
+
+### Drain-b: Wire into KuzuReplicator::sync()
+
+After `upload_tx.send(UploadWithAck(path, ack_tx))`, await the ack receiver. `sync()` now blocks until S3 has the segment.
+
+Source: `hakuzu/src/replicator.rs:207-212` (replace fire-and-forget send with ack)
+
+### Drain-c: Tests
+
+- sync() waits for upload completion before returning
+- sync() returns error if upload fails
+- sync() is idempotent (no pending segment = no-op, already handled)
+
 ### Verification
 
 ```bash
