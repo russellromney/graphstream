@@ -100,12 +100,23 @@ impl SegmentStorage for S3SegmentStorage {
 // ---------------------------------------------------------------------------
 
 /// Message sent to the concurrent uploader.
-#[derive(Debug)]
 pub enum UploadMessage {
     /// Upload a specific sealed segment file.
     Upload(PathBuf),
-    /// Graceful shutdown — drain in-flight uploads, then exit.
+    /// Upload with acknowledgment: sender waits for upload completion.
+    UploadWithAck(PathBuf, tokio::sync::oneshot::Sender<anyhow::Result<()>>),
+    /// Graceful shutdown: drain in-flight uploads, then exit.
     Shutdown,
+}
+
+impl std::fmt::Debug for UploadMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Upload(p) => f.debug_tuple("Upload").field(p).finish(),
+            Self::UploadWithAck(p, _) => f.debug_tuple("UploadWithAck").field(p).finish(),
+            Self::Shutdown => write!(f, "Shutdown"),
+        }
+    }
 }
 
 /// Upload statistics.
@@ -239,6 +250,18 @@ impl Uploader {
                         Some(UploadMessage::Upload(path)) => {
                             let ctx = self.ctx.clone();
                             in_flight.spawn(async move { ctx.upload_segment(path).await });
+                        }
+                        Some(UploadMessage::UploadWithAck(path, ack_tx)) => {
+                            let ctx = self.ctx.clone();
+                            in_flight.spawn(async move {
+                                let result = ctx.upload_segment(path).await;
+                                let ack_result = match &result {
+                                    Ok(_) => Ok(()),
+                                    Err(e) => Err(anyhow::anyhow!("{}", e)),
+                                };
+                                let _ = ack_tx.send(ack_result);
+                                result
+                            });
                         }
                         Some(UploadMessage::Shutdown) => {
                             info!(in_flight = in_flight.len(), "Uploader shutting down, draining");
@@ -931,6 +954,114 @@ mod tests {
         assert_eq!(stats.uploads_succeeded, 5);
         assert_eq!(stats.uploads_failed, 0);
         assert_eq!(stats.bytes_uploaded, 5 * data.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_upload_with_ack_success() {
+        let storage = Arc::new(MockStorage::new());
+        let uploader = make_uploader(storage.clone(), 4);
+        let (tx, handle) = spawn_uploader(uploader);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fake_segment(dir.path(), "seg-ack-ok.graphj", b"ack data");
+
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(UploadMessage::UploadWithAck(path, ack_tx))
+            .await
+            .unwrap();
+
+        // Wait for the ack.
+        let result = timeout(Duration::from_secs(5), ack_rx)
+            .await
+            .expect("ack timed out")
+            .expect("ack channel dropped");
+        assert!(result.is_ok(), "Expected Ok ack, got: {:?}", result);
+
+        tx.send(UploadMessage::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(5), handle).await.unwrap().unwrap();
+
+        assert_eq!(storage.object_count(), 1);
+        assert!(storage.has_key("test/db/journal/seg-ack-ok.graphj"));
+    }
+
+    #[tokio::test]
+    async fn test_upload_with_ack_failure() {
+        // Storage that always fails (max_failures very high).
+        let storage = Arc::new(MockStorage::with_failures(1000));
+
+        // Use a retry policy with 0 retries so the upload fails immediately.
+        let no_retry = crate::retry::RetryConfig {
+            max_retries: 0,
+            base_delay_ms: 1,
+            max_delay_ms: 1,
+            circuit_breaker_enabled: false,
+            circuit_breaker_threshold: 100,
+            circuit_breaker_cooldown_ms: 1000,
+        };
+        let uploader = Arc::new(Uploader::new(
+            storage.clone(),
+            "test/db/".to_string(),
+            Arc::new(RetryPolicy::new(no_retry)),
+            4,
+        ));
+        let (tx, handle) = spawn_uploader(uploader);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fake_segment(dir.path(), "seg-ack-fail.graphj", b"fail data");
+
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(UploadMessage::UploadWithAck(path, ack_tx))
+            .await
+            .unwrap();
+
+        // The ack should arrive with an error.
+        let result = timeout(Duration::from_secs(5), ack_rx)
+            .await
+            .expect("ack timed out")
+            .expect("ack channel dropped");
+        assert!(result.is_err(), "Expected Err ack, got: {:?}", result);
+
+        tx.send(UploadMessage::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(5), handle).await.unwrap().unwrap();
+
+        // Upload should have failed, no objects stored.
+        assert_eq!(storage.object_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_upload_with_ack_mixed_with_fire_and_forget() {
+        let storage = Arc::new(MockStorage::new());
+        let uploader = make_uploader(storage.clone(), 4);
+        let (tx, handle) = spawn_uploader(uploader);
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Fire-and-forget upload.
+        let path1 = write_fake_segment(dir.path(), "seg-ff.graphj", b"ff data");
+        tx.send(UploadMessage::Upload(path1)).await.unwrap();
+
+        // Ack upload.
+        let path2 = write_fake_segment(dir.path(), "seg-ack.graphj", b"ack data");
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(UploadMessage::UploadWithAck(path2, ack_tx))
+            .await
+            .unwrap();
+
+        // Another fire-and-forget.
+        let path3 = write_fake_segment(dir.path(), "seg-ff2.graphj", b"ff2 data");
+        tx.send(UploadMessage::Upload(path3)).await.unwrap();
+
+        // Wait for ack.
+        let result = timeout(Duration::from_secs(5), ack_rx)
+            .await
+            .expect("ack timed out")
+            .expect("ack channel dropped");
+        assert!(result.is_ok());
+
+        tx.send(UploadMessage::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(5), handle).await.unwrap().unwrap();
+
+        assert_eq!(storage.object_count(), 3);
     }
 
     /// Helper: create real sealed journal segments by writing entries via the journal writer.
