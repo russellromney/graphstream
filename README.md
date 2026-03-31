@@ -1,6 +1,6 @@
 # graphstream
 
-> **Pre-1.0.** APIs may change between minor versions.
+> **Experimental.** graphstream is under active development and not yet stable. APIs will change without notice.
 
 Journal replication engine for graph databases. Logical WAL shipping via `.graphj` segments to S3-compatible storage.
 
