@@ -90,7 +90,7 @@ let (upload_tx, uploader_handle) = spawn_journal_uploader(
 
 ## Tests
 
-86 tests across journal, chain hash, streaming, compaction, uploader, cache, and metrics modules.
+Covers journal writing, chain hash integrity, streaming decompression, compaction, uploader (including ack), cache, and metrics.
 
 ```bash
 CC=/opt/homebrew/opt/llvm/bin/clang CXX=/opt/homebrew/opt/llvm/bin/clang++ \
