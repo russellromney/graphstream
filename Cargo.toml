@@ -22,9 +22,8 @@ zstd = "0.13"
 # Protobuf
 prost = "0.13"
 
-# S3
-aws-sdk-s3 = "1"
-aws-config = { version = "1", features = ["behavior-version-latest"] }
+# hadb ecosystem shared infrastructure (retry, S3, ObjectStore, webhook, retention)
+hadb-io = { path = "../hadb/hadb-io", features = ["s3"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

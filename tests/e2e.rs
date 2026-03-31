@@ -7,17 +7,20 @@ use graphstream::graphj;
 use graphstream::journal::{self, JournalCommand, JournalReader, JournalState, PendingEntry};
 use graphstream::sync::download_new_segments;
 use graphstream::types::ParamValue;
+use hadb_io::{ObjectStore, S3Backend};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Create S3 client + bucket + unique prefix from env vars.
-async fn s3_setup() -> (aws_sdk_s3::Client, String, String) {
-    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-    let client = aws_sdk_s3::Client::new(&config);
+/// Create S3Backend + unique prefix from env vars.
+async fn s3_setup() -> (Arc<S3Backend>, String) {
     let bucket =
         std::env::var("S3_TEST_BUCKET").expect("S3_TEST_BUCKET env var required for e2e tests");
+    let endpoint = std::env::var("S3_ENDPOINT").ok();
+    let backend = S3Backend::from_env(bucket, endpoint.as_deref())
+        .await
+        .expect("Failed to create S3Backend");
     let prefix = format!("graphstream-e2e-{}/", uuid::Uuid::new_v4());
-    (client, bucket, prefix)
+    (Arc::new(backend), prefix)
 }
 
 /// Write N entries via journal writer, seal, and return the journal dir.
@@ -60,11 +63,10 @@ fn write_and_seal(
     state
 }
 
-/// Manually upload all sealed .graphj files from journal_dir to S3.
+/// Manually upload all sealed .graphj files from journal_dir via ObjectStore.
 async fn upload_sealed_files(
-    client: &aws_sdk_s3::Client,
+    store: &dyn ObjectStore,
     journal_dir: &std::path::Path,
-    bucket: &str,
     prefix: &str,
 ) -> Vec<String> {
     let mut uploaded = Vec::new();
@@ -84,14 +86,7 @@ async fn upload_sealed_files(
 
         let key = format!("{}journal/{}", prefix, name);
         let bytes = std::fs::read(&path).unwrap();
-        client
-            .put_object()
-            .bucket(bucket)
-            .key(&key)
-            .body(bytes.into())
-            .send()
-            .await
-            .unwrap();
+        store.upload_bytes(&key, bytes).await.unwrap();
         uploaded.push(key);
     }
     uploaded
@@ -105,21 +100,21 @@ async fn upload_sealed_files(
 #[tokio::test]
 #[ignore]
 async fn test_upload_then_download_roundtrip() {
-    let (client, bucket, prefix) = s3_setup().await;
+    let (store, prefix) = s3_setup().await;
     let dir = tempfile::tempdir().unwrap();
     let journal_dir = dir.path().join("journal");
 
     // Write 10 entries and seal.
     write_and_seal(&journal_dir, 10, 1024 * 1024);
 
-    // Upload sealed segments to S3.
-    let uploaded = upload_sealed_files(&client, &journal_dir, &bucket, &prefix).await;
+    // Upload sealed segments.
+    let uploaded = upload_sealed_files(&*store, &journal_dir, &prefix).await;
     assert!(!uploaded.is_empty(), "Expected at least one uploaded segment");
 
     // Download to a different directory.
     let download_dir = dir.path().join("downloaded");
     let segments =
-        download_new_segments(&client, &bucket, &prefix, &download_dir, 0)
+        download_new_segments(&*store, &prefix, &download_dir, 0)
             .await
             .unwrap();
     assert!(!segments.is_empty(), "Expected downloaded segments");
@@ -134,11 +129,11 @@ async fn test_upload_then_download_roundtrip() {
     }
 }
 
-/// Test spawn_journal_uploader actually uploads sealed segments to S3.
+/// Test spawn_journal_uploader actually uploads sealed segments.
 #[tokio::test]
 #[ignore]
 async fn test_uploader_uploads_to_s3() {
-    let (client, bucket, prefix) = s3_setup().await;
+    let (store, prefix) = s3_setup().await;
     let dir = tempfile::tempdir().unwrap();
     let journal_dir = dir.path().join("journal");
 
@@ -169,7 +164,7 @@ async fn test_uploader_uploads_to_s3() {
     let _uploader = graphstream::spawn_journal_uploader(
         tx.clone(),
         journal_dir.clone(),
-        bucket.clone(),
+        store.clone(),
         prefix.clone(),
         Duration::from_secs(1),
         shutdown_rx,
@@ -185,19 +180,7 @@ async fn test_uploader_uploads_to_s3() {
 
     // Verify segments exist on S3.
     let journal_prefix = format!("{}journal/", prefix);
-    let list_resp = client
-        .list_objects_v2()
-        .bucket(&bucket)
-        .prefix(&journal_prefix)
-        .send()
-        .await
-        .unwrap();
-
-    let keys: Vec<_> = list_resp
-        .contents()
-        .iter()
-        .filter_map(|o| o.key())
-        .collect();
+    let keys = store.list_objects(&journal_prefix).await.unwrap();
     assert!(
         !keys.is_empty(),
         "Expected uploaded segments on S3, got none. prefix={}",
@@ -207,7 +190,7 @@ async fn test_uploader_uploads_to_s3() {
     // Download and verify entries.
     let download_dir = dir.path().join("downloaded");
     let segments =
-        download_new_segments(&client, &bucket, &prefix, &download_dir, 0)
+        download_new_segments(&*store, &prefix, &download_dir, 0)
             .await
             .unwrap();
     assert!(!segments.is_empty());
@@ -221,7 +204,7 @@ async fn test_uploader_uploads_to_s3() {
 #[tokio::test]
 #[ignore]
 async fn test_sync_straddling_segment() {
-    let (client, bucket, prefix) = s3_setup().await;
+    let (store, prefix) = s3_setup().await;
     let dir = tempfile::tempdir().unwrap();
     let journal_dir = dir.path().join("journal");
 
@@ -256,7 +239,7 @@ async fn test_sync_straddling_segment() {
     std::thread::sleep(Duration::from_millis(100));
 
     // Upload all sealed segments.
-    let uploaded = upload_sealed_files(&client, &journal_dir, &bucket, &prefix).await;
+    let uploaded = upload_sealed_files(&*store, &journal_dir, &prefix).await;
     assert!(
         uploaded.len() >= 2,
         "Expected multiple segments, got {}",
@@ -266,7 +249,7 @@ async fn test_sync_straddling_segment() {
     // Download all segments first (from seq 0) to verify full chain.
     let full_dir = dir.path().join("full_download");
     let all_segments =
-        download_new_segments(&client, &bucket, &prefix, &full_dir, 0)
+        download_new_segments(&*store, &prefix, &full_dir, 0)
             .await
             .unwrap();
     assert_eq!(all_segments.len(), uploaded.len());
@@ -275,10 +258,10 @@ async fn test_sync_straddling_segment() {
     let all_entries: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(all_entries.len(), 15);
 
-    // Download from sequence 5 — should include straddling segment.
+    // Download from sequence 5 -- should include straddling segment.
     let partial_dir = dir.path().join("partial_download");
     let segments =
-        download_new_segments(&client, &bucket, &prefix, &partial_dir, 5)
+        download_new_segments(&*store, &prefix, &partial_dir, 5)
             .await
             .unwrap();
     assert!(
@@ -289,7 +272,7 @@ async fn test_sync_straddling_segment() {
     // Straddling segment means we get more segments than just those starting after 5.
     // The straddling segment's first_seq is <= 5 but it contains entries > 5.
     // Read using from_sequence to skip entries <= 5 (chain hash validation is skipped
-    // by passing [0; 32] — the reader only validates forward from the starting point).
+    // by passing [0; 32] -- the reader only validates forward from the starting point).
     let reader = JournalReader::from_sequence(&partial_dir, 6, [0u8; 32]).unwrap();
     let entries: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
     assert!(!entries.is_empty());
@@ -297,26 +280,26 @@ async fn test_sync_straddling_segment() {
     assert!(max_seq >= 10, "Expected entries up to at least seq 10, got {}", max_seq);
 }
 
-/// Test download_new_segments with empty S3 prefix (no segments uploaded).
+/// Test download_new_segments with empty prefix (no segments uploaded).
 #[tokio::test]
 #[ignore]
 async fn test_sync_empty_prefix() {
-    let (client, bucket, prefix) = s3_setup().await;
+    let (store, prefix) = s3_setup().await;
     let dir = tempfile::tempdir().unwrap();
     let download_dir = dir.path().join("downloaded");
 
     let segments =
-        download_new_segments(&client, &bucket, &prefix, &download_dir, 0)
+        download_new_segments(&*store, &prefix, &download_dir, 0)
             .await
             .unwrap();
     assert!(segments.is_empty());
 }
 
-/// Test that params survive the upload → download → read roundtrip.
+/// Test that params survive the upload -> download -> read roundtrip.
 #[tokio::test]
 #[ignore]
 async fn test_params_survive_s3_roundtrip() {
-    let (client, bucket, prefix) = s3_setup().await;
+    let (store, prefix) = s3_setup().await;
     let dir = tempfile::tempdir().unwrap();
     let journal_dir = dir.path().join("journal");
 
@@ -365,10 +348,10 @@ async fn test_params_survive_s3_roundtrip() {
     std::thread::sleep(Duration::from_millis(100));
 
     // Upload and download.
-    upload_sealed_files(&client, &journal_dir, &bucket, &prefix).await;
+    upload_sealed_files(&*store, &journal_dir, &prefix).await;
 
     let download_dir = dir.path().join("downloaded");
-    download_new_segments(&client, &bucket, &prefix, &download_dir, 0)
+    download_new_segments(&*store, &prefix, &download_dir, 0)
         .await
         .unwrap();
 

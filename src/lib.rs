@@ -13,7 +13,6 @@ pub mod cache;
 pub mod graphj;
 pub mod journal;
 pub mod metrics;
-pub mod retry;
 pub mod sync;
 pub mod types;
 pub mod uploader;
@@ -43,9 +42,10 @@ pub use types::{
 };
 pub use cache::{CacheConfig, CacheStats, CleanupStats, SegmentCache};
 pub use metrics::GraphstreamMetrics;
-pub use retry::{RetryConfig, RetryPolicy};
+// Retry infrastructure from hadb-io (graphstream's retry.rs deleted in Phase Aether).
+pub use hadb_io::{RetryConfig, RetryPolicy};
 pub use uploader::{
     run_background_compaction, spawn_journal_uploader, spawn_journal_uploader_with_cache,
-    spawn_journal_uploader_with_retry, spawn_uploader, CompactionConfig, SegmentStorage,
-    S3SegmentStorage, UploadMessage, Uploader, UploaderStats,
+    spawn_journal_uploader_with_retry, spawn_uploader, CompactionConfig, ObjectStoreStorage,
+    SegmentStorage, UploadMessage, Uploader, UploaderStats,
 };

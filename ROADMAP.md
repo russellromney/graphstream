@@ -1,10 +1,21 @@
 # graphstream Roadmap
 
-## Phase Aether: hadb-io Migration (hadb Phase 1c)
+## Phase Aether: hadb-io Migration (hadb Phase 1c) (DONE)
 
 > After: graphstream Phase 8 (Structured Tracing) · Before: hakuzu Phase Cascade
 
 graphstream independently implements retry, S3 operations, and upload concurrency that hadb-io now provides generically. graphstream's `retry.rs` (679 lines) was copy-pasted from walrust-core and has already drifted (different rand API, missing webhook support). walrust completed this migration in hadb Phase 1b (~4,275 lines deleted, 303 tests passing). graphstream is next.
+
+### Results
+- **Deleted**: `src/retry.rs` (679 lines), `S3SegmentStorage`, direct `aws-sdk-s3`/`aws-config` dependencies
+- **Net**: -404 lines (6 files changed, 455 insertions, 859 deletions)
+- **Tests**: 86 passing (42 unit + 8 chain_hash + 9 graphj + 23 journal + 4 streaming), 5 e2e ignored (need S3 creds)
+- **Bug fixed**: `uploads_failed` counter was never incremented on failure (regression test added)
+
+### Deferred
+- **Aether-c (ConcurrentUploader)**: hadb-io's `ConcurrentUploader<H>` uses `UploadMessage::Upload(Id) | Shutdown`. graphstream needs `UploadWithAck(PathBuf, oneshot::Sender)` for hakuzu's synchronous replication. Migrate after hadb-io gains ack support.
+- **Retention (GFS)**: `hadb_io::RetentionPolicy` is available via the dependency. Wiring it to replace age-only cache cleanup deferred; current cleanup works and GFS is more relevant for S3-side segment rotation.
+- **uploader.rs size**: 1357 lines (was 1073 pre-migration). Consider splitting `spawn_journal_uploader*` functions into a separate module.
 
 ### Aether-a: Replace retry.rs with hadb-io
 
