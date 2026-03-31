@@ -44,7 +44,7 @@ pub trait SegmentStorage: Send + Sync + 'static {
     /// Upload bytes to the given key. Must be idempotent.
     async fn upload_bytes(&self, key: &str, data: Vec<u8>) -> Result<()>;
 
-    /// Upload a file by path. Default reads into memory; S3 impl streams via ByteStream.
+    /// Upload a file by path. Default reads into memory; ObjectStore impls may stream.
     async fn upload_file(&self, key: &str, path: &Path) -> Result<()> {
         let data =
             std::fs::read(path).map_err(|e| anyhow!("Read {}: {e}", path.display()))?;
