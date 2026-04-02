@@ -22,7 +22,7 @@ prost = "0.13"
 
 # hadb ecosystem
 hadb-changeset = { path = "../hadb-changeset", version = "0.3.1", features = ["journal"] }
-hadb-io = { path = "../hadb/hadb-io", version = "0.2", features = ["s3"] }
+hadb-io = { path = "../hadb/hadb-io", version = "0.3", features = ["s3"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

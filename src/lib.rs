@@ -47,5 +47,5 @@ pub use hadb_io::{RetryConfig, RetryPolicy};
 pub use uploader::{
     run_background_compaction, spawn_journal_uploader, spawn_journal_uploader_with_cache,
     spawn_journal_uploader_with_retry, spawn_uploader, CompactionConfig, ObjectStoreStorage,
-    SegmentStorage, UploadMessage, Uploader, UploaderStats,
+    SegmentStorage, SegmentUploadHandler, UploadMessage, Uploader, UploaderStats,
 };

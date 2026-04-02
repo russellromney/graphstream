@@ -1,8 +1,13 @@
 //! Concurrent uploader for sealed journal segments.
 //!
+//! Uses hadb-io's `ConcurrentUploader<SegmentUploadHandler>` for bounded-concurrency
+//! uploads with ack support. graphstream provides the `SegmentUploadHandler` implementation
+//! (S3 key formatting, retry, cache mark, webhook) while hadb-io manages concurrency,
+//! stats, shutdown drain, and pending resume.
+//!
 //! Architecture:
 //! ```text
-//! Journal Writer Task         Uploader Task (JoinSet, max N concurrent)
+//! Journal Writer Task         ConcurrentUploader (JoinSet, max N concurrent)
 //!       |                          |
 //!   seal_segment()                 |
 //!       |                          |
@@ -16,9 +21,7 @@
 //!                               spawn upload task ──┤ (up to max_concurrent)
 //!                               spawn upload task ──┘
 //!                                      |
-//!                               reap completed:
-//!                                 read file bytes
-//!                                 upload via ObjectStore
+//!                               reap completed → update stats
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -28,11 +31,17 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
-use tokio::task::JoinSet;
 use tracing::{error, info};
 
 use crate::journal::{JournalCommand, JournalSender};
 use hadb_io::RetryPolicy;
+
+// Re-export hadb-io's upload types as graphstream's public API.
+pub use hadb_io::UploadMessage;
+pub use hadb_io::UploaderStats;
+
+/// Type alias: graphstream's uploader is ConcurrentUploader over PathBuf IDs.
+pub type Uploader = hadb_io::ConcurrentUploader<SegmentUploadHandler>;
 
 // ---------------------------------------------------------------------------
 // SegmentStorage trait
@@ -67,71 +76,57 @@ impl SegmentStorage for ObjectStoreStorage {
 }
 
 // ---------------------------------------------------------------------------
-// Upload messages and stats
+// SegmentUploadHandler — implements hadb_io::UploadHandler for journal segments
 // ---------------------------------------------------------------------------
 
-/// Message sent to the concurrent uploader.
-pub enum UploadMessage {
-    /// Upload a specific sealed segment file.
-    Upload(PathBuf),
-    /// Upload with acknowledgment: sender waits for upload completion.
-    UploadWithAck(PathBuf, tokio::sync::oneshot::Sender<anyhow::Result<()>>),
-    /// Graceful shutdown: drain in-flight uploads, then exit.
-    Shutdown,
-}
-
-impl std::fmt::Debug for UploadMessage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Upload(p) => f.debug_tuple("Upload").field(p).finish(),
-            Self::UploadWithAck(p, _) => f.debug_tuple("UploadWithAck").field(p).finish(),
-            Self::Shutdown => write!(f, "Shutdown"),
-        }
-    }
-}
-
-/// Upload statistics.
-#[derive(Debug, Clone, Default)]
-pub struct UploaderStats {
-    pub uploads_attempted: u64,
-    pub uploads_succeeded: u64,
-    pub uploads_failed: u64,
-    pub bytes_uploaded: u64,
-}
-
-// ---------------------------------------------------------------------------
-// UploadTaskContext — cloned into each spawned task
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-struct UploadTaskContext {
+/// Upload handler for sealed journal segments.
+///
+/// Implements hadb-io's `UploadHandler` trait. Each upload:
+/// 1. Parses sequence from filename
+/// 2. Computes S3 key via `format_key()`
+/// 3. Uploads with retry via `RetryPolicy`
+/// 4. Marks as uploaded in cache (if configured)
+/// 5. Fires webhook on failure (if configured)
+pub struct SegmentUploadHandler {
     storage: Arc<dyn SegmentStorage>,
     prefix: String,
     db_name: String,
     retry_policy: Arc<RetryPolicy>,
-    stats: Arc<tokio::sync::Mutex<UploaderStats>>,
     cache: Option<Arc<tokio::sync::Mutex<crate::cache::SegmentCache>>>,
     webhook: Option<Arc<hadb_io::WebhookSender>>,
 }
 
-struct UploadResult;
-
-impl UploadTaskContext {
-    /// Upload a single sealed segment file with retry.
-    /// Uses streaming upload (ByteStream) for S3 — file is NOT loaded into memory.
-    async fn upload_segment(&self, path: PathBuf) -> Result<UploadResult> {
-        {
-            let mut stats = self.stats.lock().await;
-            stats.uploads_attempted += 1;
+impl SegmentUploadHandler {
+    pub fn new(
+        storage: Arc<dyn SegmentStorage>,
+        prefix: String,
+        db_name: String,
+        retry_policy: Arc<RetryPolicy>,
+        cache: Option<Arc<tokio::sync::Mutex<crate::cache::SegmentCache>>>,
+        webhook: Option<Arc<hadb_io::WebhookSender>>,
+    ) -> Self {
+        Self {
+            storage,
+            prefix,
+            db_name,
+            retry_policy,
+            cache,
+            webhook,
         }
+    }
+}
 
+#[async_trait]
+impl hadb_io::UploadHandler for SegmentUploadHandler {
+    type Id = PathBuf;
+
+    async fn upload(&self, path: PathBuf) -> Result<u64> {
         let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| anyhow!("Invalid segment path: {}", path.display()))?
             .to_string();
 
-        // Parse seq from filename (journal-{seq:016}.hadbj or compacted-{ts}.hadbj).
         let seq = parse_seq_from_filename(&file_name)
             .ok_or_else(|| anyhow!("Cannot parse seq from filename: {}", file_name))?;
         let key = hadb_changeset::storage::format_key(
@@ -142,7 +137,6 @@ impl UploadTaskContext {
             hadb_changeset::storage::ChangesetKind::Journal,
         );
 
-        // Get file size before upload for stats tracking.
         let data_len = std::fs::metadata(&path)
             .map_err(|e| anyhow!("Metadata {}: {e}", path.display()))?
             .len();
@@ -162,10 +156,6 @@ impl UploadTaskContext {
             .await;
 
         if let Err(ref e) = upload_result {
-            {
-                let mut stats = self.stats.lock().await;
-                stats.uploads_failed += 1;
-            }
             if let Some(ref webhook) = self.webhook {
                 let payload = hadb_io::WebhookPayload::new(
                     hadb_io::WebhookEvent::UploadFailed,
@@ -179,12 +169,6 @@ impl UploadTaskContext {
 
         upload_result?;
 
-        {
-            let mut stats = self.stats.lock().await;
-            stats.uploads_succeeded += 1;
-            stats.bytes_uploaded += data_len;
-        }
-
         // Mark as uploaded in cache.
         if let Some(ref cache) = self.cache {
             let mut cache = cache.lock().await;
@@ -194,134 +178,44 @@ impl UploadTaskContext {
         }
 
         info!(segment = %file_name, key = %key, size_bytes = data_len, "Uploaded segment");
-        Ok(UploadResult)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Uploader — JoinSet-based concurrent upload engine
-// ---------------------------------------------------------------------------
-
-/// Concurrent segment uploader.
-pub struct Uploader {
-    ctx: UploadTaskContext,
-    max_concurrent: usize,
-}
-
-impl Uploader {
-    pub fn new(
-        storage: Arc<dyn SegmentStorage>,
-        prefix: String,
-        db_name: String,
-        retry_policy: Arc<RetryPolicy>,
-        max_concurrent: usize,
-    ) -> Self {
-        Self::with_options(storage, prefix, db_name, retry_policy, max_concurrent, None, None)
+        Ok(data_len)
     }
 
-    pub fn with_cache(
-        storage: Arc<dyn SegmentStorage>,
-        prefix: String,
-        db_name: String,
-        retry_policy: Arc<RetryPolicy>,
-        max_concurrent: usize,
-        cache: Option<Arc<tokio::sync::Mutex<crate::cache::SegmentCache>>>,
-    ) -> Self {
-        Self::with_options(storage, prefix, db_name, retry_policy, max_concurrent, cache, None)
-    }
-
-    pub fn with_options(
-        storage: Arc<dyn SegmentStorage>,
-        prefix: String,
-        db_name: String,
-        retry_policy: Arc<RetryPolicy>,
-        max_concurrent: usize,
-        cache: Option<Arc<tokio::sync::Mutex<crate::cache::SegmentCache>>>,
-        webhook: Option<Arc<hadb_io::WebhookSender>>,
-    ) -> Self {
-        Self {
-            ctx: UploadTaskContext {
-                storage,
-                prefix,
-                db_name,
-                retry_policy,
-                stats: Arc::new(tokio::sync::Mutex::new(UploaderStats::default())),
-                cache,
-                webhook,
-            },
-            max_concurrent: max_concurrent.max(1),
-        }
-    }
-
-    /// Run the uploader until Shutdown or channel close.
-    pub async fn run(&self, mut rx: mpsc::Receiver<UploadMessage>) -> Result<UploaderStats> {
-        let mut in_flight: JoinSet<Result<UploadResult>> = JoinSet::new();
-
-        loop {
-            tokio::select! {
-                msg = rx.recv(), if in_flight.len() < self.max_concurrent => {
-                    match msg {
-                        Some(UploadMessage::Upload(path)) => {
-                            let ctx = self.ctx.clone();
-                            in_flight.spawn(async move { ctx.upload_segment(path).await });
-                        }
-                        Some(UploadMessage::UploadWithAck(path, ack_tx)) => {
-                            let ctx = self.ctx.clone();
-                            in_flight.spawn(async move {
-                                let result = ctx.upload_segment(path).await;
-                                let ack_result = match &result {
-                                    Ok(_) => Ok(()),
-                                    Err(e) => Err(anyhow::anyhow!("{}", e)),
-                                };
-                                let _ = ack_tx.send(ack_result);
-                                result
-                            });
-                        }
-                        Some(UploadMessage::Shutdown) => {
-                            info!(in_flight = in_flight.len(), "Uploader shutting down, draining");
-                            while let Some(result) = in_flight.join_next().await {
-                                Self::handle_join_result(result);
-                            }
-                            break;
-                        }
-                        None => {
-                            info!(in_flight = in_flight.len(), "Uploader channel closed, draining");
-                            while let Some(result) = in_flight.join_next().await {
-                                Self::handle_join_result(result);
-                            }
-                            break;
-                        }
-                    }
+    fn pending_items(&self) -> Vec<PathBuf> {
+        let Some(ref cache) = self.cache else {
+            return Vec::new();
+        };
+        // pending_items is sync (called once at startup), so we can't await.
+        // Use try_lock to avoid blocking. If the lock is held, return empty
+        // and the seal timer will pick up pending segments on next tick.
+        let Ok(cache_guard) = cache.try_lock() else {
+            return Vec::new();
+        };
+        match cache_guard.pending_segments() {
+            Ok(pending) => {
+                if !pending.is_empty() {
+                    info!(
+                        "Journal uploader: resuming {} pending uploads from cache",
+                        pending.len()
+                    );
                 }
-                Some(result) = in_flight.join_next() => {
-                    Self::handle_join_result(result);
-                }
+                pending
+            }
+            Err(e) => {
+                error!("Journal uploader: failed to read pending segments: {e}");
+                Vec::new()
             }
         }
-
-        let stats = self.ctx.stats.lock().await.clone();
-        info!(
-            attempted = stats.uploads_attempted,
-            succeeded = stats.uploads_succeeded,
-            failed = stats.uploads_failed,
-            bytes = stats.bytes_uploaded,
-            "Uploader stopped"
-        );
-        Ok(stats)
     }
 
-    fn handle_join_result(result: Result<Result<UploadResult>, tokio::task::JoinError>) {
-        match result {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => error!("Upload task failed: {e}"),
-            Err(e) => error!("Upload task panicked: {e}"),
-        }
-    }
-
-    pub async fn stats(&self) -> UploaderStats {
-        self.ctx.stats.lock().await.clone()
+    fn name(&self) -> &str {
+        &self.db_name
     }
 }
+
+// ---------------------------------------------------------------------------
+// spawn_uploader — thin wrapper around hadb_io::spawn_uploader
+// ---------------------------------------------------------------------------
 
 /// Spawn uploader task and return (sender, handle).
 ///
@@ -329,14 +223,8 @@ impl Uploader {
 /// in-flight uploads complete before the runtime exits.
 pub fn spawn_uploader(
     uploader: Arc<Uploader>,
-) -> (mpsc::Sender<UploadMessage>, tokio::task::JoinHandle<()>) {
-    let (tx, rx) = mpsc::channel(256);
-    let handle = tokio::spawn(async move {
-        if let Err(e) = uploader.run(rx).await {
-            error!("Uploader task failed: {e}");
-        }
-    });
-    (tx, handle)
+) -> (mpsc::Sender<UploadMessage<PathBuf>>, tokio::task::JoinHandle<()>) {
+    hadb_io::spawn_uploader(uploader)
 }
 
 // ---------------------------------------------------------------------------
@@ -357,7 +245,7 @@ pub fn spawn_journal_uploader(
     db_name: String,
     interval: Duration,
     shutdown: tokio::sync::watch::Receiver<bool>,
-) -> (mpsc::Sender<UploadMessage>, tokio::task::JoinHandle<()>) {
+) -> (mpsc::Sender<UploadMessage<PathBuf>>, tokio::task::JoinHandle<()>) {
     spawn_journal_uploader_with_retry(
         journal_tx,
         journal_dir,
@@ -382,7 +270,7 @@ pub fn spawn_journal_uploader_with_retry(
     shutdown: tokio::sync::watch::Receiver<bool>,
     retry_policy: RetryPolicy,
     max_concurrent: usize,
-) -> (mpsc::Sender<UploadMessage>, tokio::task::JoinHandle<()>) {
+) -> (mpsc::Sender<UploadMessage<PathBuf>>, tokio::task::JoinHandle<()>) {
     spawn_journal_uploader_with_cache(
         journal_tx,
         journal_dir,
@@ -413,7 +301,7 @@ pub fn spawn_journal_uploader_with_cache(
     cache: Option<Arc<tokio::sync::Mutex<crate::cache::SegmentCache>>>,
     cache_config: Option<crate::cache::CacheConfig>,
     webhook_configs: Vec<hadb_io::WebhookConfig>,
-) -> (mpsc::Sender<UploadMessage>, tokio::task::JoinHandle<()>) {
+) -> (mpsc::Sender<UploadMessage<PathBuf>>, tokio::task::JoinHandle<()>) {
     let retry_policy = Arc::new(retry_policy);
     let webhook = if webhook_configs.is_empty() {
         None
@@ -421,59 +309,37 @@ pub fn spawn_journal_uploader_with_cache(
         Some(Arc::new(hadb_io::WebhookSender::new(webhook_configs)))
     };
 
-    let (upload_tx, upload_rx) = mpsc::channel::<UploadMessage>(256);
+    let storage: Arc<dyn SegmentStorage> = Arc::new(ObjectStoreStorage(object_store));
+
+    let handler = Arc::new(SegmentUploadHandler::new(
+        storage,
+        prefix.clone(),
+        db_name,
+        retry_policy.clone(),
+        cache.clone(),
+        webhook.clone(),
+    ));
+
+    let uploader = Arc::new(hadb_io::ConcurrentUploader::new(handler, max_concurrent));
+    let (upload_tx, upload_rx) = mpsc::channel::<UploadMessage<PathBuf>>(256);
     let upload_tx_clone = upload_tx.clone();
 
-    let handle = tokio::spawn(async move {
-        let storage: Arc<dyn SegmentStorage> = Arc::new(ObjectStoreStorage(object_store));
-
-        let uploader = Arc::new(Uploader::with_options(
-            storage,
-            prefix.clone(),
-            db_name,
-            retry_policy.clone(),
-            max_concurrent,
-            cache.clone(),
-            webhook.clone(),
-        ));
-
-        // Resume pending uploads from cache on startup.
-        if let Some(ref cache) = cache {
-            let cache_guard = cache.lock().await;
-            match cache_guard.pending_segments() {
-                Ok(pending) => {
-                    if !pending.is_empty() {
-                        info!(
-                            "Journal uploader: resuming {} pending uploads from cache",
-                            pending.len()
-                        );
-                        for path in pending {
-                            if upload_tx_clone.send(UploadMessage::Upload(path)).await.is_err() {
-                                error!("Journal uploader: upload channel closed during resume");
-                                return;
-                            }
-                        }
-                    }
-                }
-                Err(e) => error!("Journal uploader: failed to read pending segments: {e}"),
+    // Spawn the concurrent uploader in its own task.
+    let uploader_handle = {
+        let uploader = uploader.clone();
+        tokio::spawn(async move {
+            if let Err(e) = uploader.run(upload_rx).await {
+                error!("Concurrent uploader failed: {e}");
             }
-        }
+        })
+    };
 
-        // Spawn the concurrent uploader in its own task.
-        let uploader_handle = {
-            let uploader = uploader.clone();
-            tokio::spawn(async move {
-                if let Err(e) = uploader.run(upload_rx).await {
-                    error!("Concurrent uploader failed: {e}");
-                }
-            })
-        };
-
-        // Seal timer loop — seals + scans + sends Upload messages.
+    let handle = tokio::spawn(async move {
+        // Seal timer loop
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // Cleanup timer — every 5 minutes.
+        // Cleanup timer
         let mut cleanup_ticker = tokio::time::interval(Duration::from_secs(300));
         cleanup_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let cleanup_config = cache_config.unwrap_or_default();
@@ -543,7 +409,6 @@ pub fn spawn_journal_uploader_with_cache(
             match scan_sealed_segments(&journal_dir) {
                 Ok(paths) => {
                     for path in paths {
-                        // Skip already-uploaded segments when cache is available.
                         if let Some(ref cache) = cache {
                             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                                 let cache_guard = cache.lock().await;
@@ -636,7 +501,7 @@ impl Default for CompactionConfig {
 pub async fn run_background_compaction(
     journal_dir: &Path,
     cache: &Arc<tokio::sync::Mutex<crate::cache::SegmentCache>>,
-    upload_tx: &mpsc::Sender<UploadMessage>,
+    upload_tx: &mpsc::Sender<UploadMessage<PathBuf>>,
     config: &CompactionConfig,
 ) -> Result<bool> {
     // Get uploaded segment paths from cache.
@@ -826,15 +691,25 @@ mod tests {
         }
     }
 
-    fn make_uploader(
+    fn make_handler(
         storage: Arc<dyn SegmentStorage>,
-        max_concurrent: usize,
-    ) -> Arc<Uploader> {
-        Arc::new(Uploader::new(
+    ) -> Arc<SegmentUploadHandler> {
+        Arc::new(SegmentUploadHandler::new(
             storage,
             "test/".to_string(),
             "db".to_string(),
             Arc::new(RetryPolicy::default_policy()),
+            None,
+            None,
+        ))
+    }
+
+    fn make_uploader(
+        storage: Arc<dyn SegmentStorage>,
+        max_concurrent: usize,
+    ) -> Arc<Uploader> {
+        Arc::new(hadb_io::ConcurrentUploader::new(
+            make_handler(storage),
             max_concurrent,
         ))
     }
@@ -900,7 +775,6 @@ mod tests {
         timeout(Duration::from_secs(10), handle).await.unwrap().unwrap();
 
         assert_eq!(storage.object_count(), 9);
-        // Peak concurrent should not exceed our limit of 3.
         assert!(
             storage.peak_concurrent() <= 3,
             "Peak concurrent {} exceeded limit 3",
@@ -910,8 +784,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_is_faster_than_sequential() {
-        // Sequential: 4 uploads x 50ms each = ~200ms
-        // Concurrent (4): 4 uploads / 4 concurrent = ~50ms
         let delay = Duration::from_millis(50);
 
         // Sequential (max_concurrent=1)
@@ -947,7 +819,6 @@ mod tests {
         assert_eq!(storage_seq.object_count(), 4);
         assert_eq!(storage_con.object_count(), 4);
 
-        // Concurrent should be significantly faster.
         assert!(
             elapsed_con < elapsed_seq,
             "Concurrent ({:?}) should be faster than sequential ({:?})",
@@ -968,19 +839,16 @@ mod tests {
             tx.send(UploadMessage::Upload(path)).await.unwrap();
         }
 
-        // Small delay to let uploads start, then shutdown.
         tokio::time::sleep(Duration::from_millis(10)).await;
         tx.send(UploadMessage::Shutdown).await.unwrap();
 
         timeout(Duration::from_secs(5), handle).await.unwrap().unwrap();
 
-        // All 4 should complete despite shutdown (drain).
         assert_eq!(storage.object_count(), 4);
     }
 
     #[tokio::test]
     async fn test_failure_doesnt_block_others() {
-        // First upload fails once, then succeeds on retry.
         let storage = Arc::new(MockStorage::with_failures(1));
         let uploader = make_uploader(storage.clone(), 4);
         let (tx, handle) = spawn_uploader(uploader);
@@ -994,8 +862,6 @@ mod tests {
 
         timeout(Duration::from_secs(5), handle).await.unwrap().unwrap();
 
-        // At least the non-failing uploads should complete.
-        // With default retry policy, the first one should also retry and succeed.
         assert!(storage.object_count() >= 2);
     }
 
@@ -1009,7 +875,6 @@ mod tests {
         let path = write_fake_segment(dir.path(), "journal-0000000000000500.hadbj", b"data");
         tx.send(UploadMessage::Upload(path)).await.unwrap();
 
-        // Drop sender instead of sending Shutdown.
         drop(tx);
 
         timeout(Duration::from_secs(5), handle).await.unwrap().unwrap();
@@ -1054,7 +919,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Wait for the ack.
         let result = timeout(Duration::from_secs(5), ack_rx)
             .await
             .expect("ack timed out")
@@ -1070,10 +934,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_with_ack_failure() {
-        // Storage that always fails (max_failures very high).
         let storage = Arc::new(MockStorage::with_failures(1000));
 
-        // Use a retry policy with 0 retries so the upload fails immediately.
         let no_retry = hadb_io::RetryConfig {
             max_retries: 0,
             base_delay_ms: 1,
@@ -1082,13 +944,15 @@ mod tests {
             circuit_breaker_threshold: 100,
             circuit_breaker_cooldown_ms: 1000,
         };
-        let uploader = Arc::new(Uploader::new(
+        let handler = Arc::new(SegmentUploadHandler::new(
             storage.clone(),
             "test/".to_string(),
             "db".to_string(),
             Arc::new(RetryPolicy::new(no_retry)),
-            4,
+            None,
+            None,
         ));
+        let uploader = Arc::new(hadb_io::ConcurrentUploader::new(handler, 4));
         let (tx, handle) = spawn_uploader(uploader);
 
         let dir = tempfile::tempdir().unwrap();
@@ -1099,7 +963,6 @@ mod tests {
             .await
             .unwrap();
 
-        // The ack should arrive with an error.
         let result = timeout(Duration::from_secs(5), ack_rx)
             .await
             .expect("ack timed out")
@@ -1109,7 +972,6 @@ mod tests {
         tx.send(UploadMessage::Shutdown).await.unwrap();
         timeout(Duration::from_secs(5), handle).await.unwrap().unwrap();
 
-        // Upload should have failed, no objects stored.
         assert_eq!(storage.object_count(), 0);
     }
 
@@ -1121,22 +983,18 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
 
-        // Fire-and-forget upload.
         let path1 = write_fake_segment(dir.path(), "journal-0000000000000801.hadbj", b"ff data");
         tx.send(UploadMessage::Upload(path1)).await.unwrap();
 
-        // Ack upload.
         let path2 = write_fake_segment(dir.path(), "journal-0000000000000802.hadbj", b"ack data");
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         tx.send(UploadMessage::UploadWithAck(path2, ack_tx))
             .await
             .unwrap();
 
-        // Another fire-and-forget.
         let path3 = write_fake_segment(dir.path(), "journal-0000000000000803.hadbj", b"ff2 data");
         tx.send(UploadMessage::Upload(path3)).await.unwrap();
 
-        // Wait for ack.
         let result = timeout(Duration::from_secs(5), ack_rx)
             .await
             .expect("ack timed out")
@@ -1179,10 +1037,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal_dir = dir.path().join("journal");
 
-        // Create multiple small sealed segments.
         create_sealed_segments(&journal_dir, 20, 512);
 
-        // Set up cache and mark all segments as uploaded.
         let mut cache = crate::cache::SegmentCache::new(&journal_dir).unwrap();
         let pending = cache.pending_segments().unwrap();
         assert!(pending.len() >= 3, "Need at least 3 segments, got {}", pending.len());
@@ -1192,9 +1048,8 @@ mod tests {
         }
         let cache = Arc::new(tokio::sync::Mutex::new(cache));
 
-        let (upload_tx, mut upload_rx) = mpsc::channel::<UploadMessage>(256);
+        let (upload_tx, mut upload_rx) = mpsc::channel::<UploadMessage<PathBuf>>(256);
 
-        // Compaction with threshold=3.
         let config = CompactionConfig {
             threshold: 3,
             zstd_level: 3,
@@ -1203,21 +1058,18 @@ mod tests {
             run_background_compaction(&journal_dir, &cache, &upload_tx, &config).await.unwrap();
         assert!(result, "Compaction should trigger when uploaded >= threshold");
 
-        // Verify a compacted segment was queued for upload.
         match upload_rx.try_recv() {
             Ok(UploadMessage::Upload(path)) => {
                 let name = path.file_name().unwrap().to_str().unwrap().to_string();
                 assert!(name.starts_with("compacted-"), "Expected compacted-*, got {name}");
                 assert!(path.exists(), "Compacted file should exist on disk");
 
-                // Verify the compacted file is valid and readable.
                 let reader = crate::journal::JournalReader::open(
                     path.parent().unwrap(),
                 ).unwrap();
                 let entries: Vec<_> = reader
                     .filter_map(|r| r.ok())
                     .collect();
-                // Compacted + original sealed segments both present — entries should be >= 20.
                 assert!(entries.len() >= 20, "Expected >= 20 entries, got {}", entries.len());
             }
             other => panic!("Expected Upload message, got: {other:?}"),
@@ -1229,7 +1081,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal_dir = dir.path().join("journal");
 
-        // Create 1 segment (only 1 entry, 1MB segment = no rotation).
         create_sealed_segments(&journal_dir, 1, 1024 * 1024);
 
         let mut cache = crate::cache::SegmentCache::new(&journal_dir).unwrap();
@@ -1239,8 +1090,8 @@ mod tests {
         }
         let cache = Arc::new(tokio::sync::Mutex::new(cache));
 
-        let (upload_tx, _rx) = mpsc::channel::<UploadMessage>(256);
-        let config = CompactionConfig::default(); // threshold = 10
+        let (upload_tx, _rx) = mpsc::channel::<UploadMessage<PathBuf>>(256);
+        let config = CompactionConfig::default();
         let result =
             run_background_compaction(&journal_dir, &cache, &upload_tx, &config).await.unwrap();
         assert!(!result, "Compaction should not trigger below threshold");
@@ -1251,7 +1102,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal_dir = dir.path().join("journal");
 
-        // Create enough segments.
         create_sealed_segments(&journal_dir, 20, 512);
 
         let mut cache = crate::cache::SegmentCache::new(&journal_dir).unwrap();
@@ -1261,12 +1111,11 @@ mod tests {
             cache.mark_uploaded(name).unwrap();
         }
 
-        // Create a fake "compacted-" file to verify it's excluded from compaction input.
         let fake_compacted = journal_dir.join("compacted-0000000000.hadbj");
         std::fs::write(&fake_compacted, b"fake").unwrap();
 
         let cache = Arc::new(tokio::sync::Mutex::new(cache));
-        let (upload_tx, mut upload_rx) = mpsc::channel::<UploadMessage>(256);
+        let (upload_tx, mut upload_rx) = mpsc::channel::<UploadMessage<PathBuf>>(256);
 
         let config = CompactionConfig {
             threshold: 3,
@@ -1276,7 +1125,6 @@ mod tests {
             run_background_compaction(&journal_dir, &cache, &upload_tx, &config).await.unwrap();
         assert!(result, "Compaction should still trigger");
 
-        // The queued compacted file should NOT be the fake one.
         match upload_rx.try_recv() {
             Ok(UploadMessage::Upload(path)) => {
                 let name = path.file_name().unwrap().to_str().unwrap();
@@ -1292,7 +1140,6 @@ mod tests {
     async fn test_object_store_storage_upload() {
         use std::path::Path as StdPath;
 
-        /// Minimal mock ObjectStore for testing the SegmentStorage bridge.
         struct InMemStore {
             objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         }
@@ -1343,7 +1190,6 @@ mod tests {
         let store = Arc::new(InMemStore::new());
         let storage: Arc<dyn SegmentStorage> = Arc::new(ObjectStoreStorage(store.clone()));
 
-        // Upload via SegmentStorage (delegates to ObjectStore).
         storage.upload_bytes("test/key1", b"hello".to_vec()).await.unwrap();
 
         let dir = tempfile::tempdir().unwrap();
@@ -1356,7 +1202,7 @@ mod tests {
         assert!(keys.contains(&"test/key2".to_string()));
     }
 
-    /// Regression: uploads_failed must be incremented when upload_segment fails.
+    /// Regression: uploads_failed must be incremented when upload fails.
     #[tokio::test]
     async fn test_uploads_failed_counter() {
         let storage = Arc::new(MockStorage::with_failures(1000));
@@ -1368,13 +1214,15 @@ mod tests {
             circuit_breaker_threshold: 100,
             circuit_breaker_cooldown_ms: 1000,
         };
-        let uploader = Arc::new(Uploader::new(
+        let handler = Arc::new(SegmentUploadHandler::new(
             storage.clone(),
             "test/".to_string(),
             "db".to_string(),
             Arc::new(RetryPolicy::new(no_retry)),
-            4,
+            None,
+            None,
         ));
+        let uploader = Arc::new(hadb_io::ConcurrentUploader::new(handler, 4));
         let uploader_ref = uploader.clone();
         let (tx, handle) = spawn_uploader(uploader);
 
@@ -1397,16 +1245,16 @@ mod tests {
     /// Test that Uploader works end-to-end with ObjectStoreStorage.
     #[tokio::test]
     async fn test_uploader_with_object_store_storage() {
-        // Reuse MockStorage (implements SegmentStorage) via Uploader.
-        // This test verifies the integration path when ObjectStoreStorage is used.
         let storage = Arc::new(MockStorage::new());
-        let uploader = Arc::new(Uploader::new(
+        let handler = Arc::new(SegmentUploadHandler::new(
             storage.clone(),
             "db/".to_string(),
             "mydb".to_string(),
             Arc::new(RetryPolicy::default_policy()),
-            4,
+            None,
+            None,
         ));
+        let uploader = Arc::new(hadb_io::ConcurrentUploader::new(handler, 4));
         let (tx, handle) = spawn_uploader(uploader);
 
         let dir = tempfile::tempdir().unwrap();
@@ -1419,9 +1267,7 @@ mod tests {
         timeout(Duration::from_secs(5), handle).await.unwrap().unwrap();
 
         assert_eq!(storage.object_count(), 5);
-        // seq 1000 = 0x3e8
         assert!(storage.has_key("db/mydb/0000/00000000000003e8.hadbj"));
-        // seq 1004 = 0x3ec
         assert!(storage.has_key("db/mydb/0000/00000000000003ec.hadbj"));
     }
 }
