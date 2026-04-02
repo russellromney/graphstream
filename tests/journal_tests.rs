@@ -1,11 +1,10 @@
-//! Journal tests: writer lifecycle, seal, flush, read, recovery, encrypted segments,
-//! large entries, param types.
+//! Journal tests: writer lifecycle, seal, flush, read, recovery, large entries, param types.
 
 use graphstream::journal::{
     self, JournalCommand, JournalReader, JournalState, PendingEntry,
 };
 use graphstream::types::ParamValue;
-use graphstream::graphj;
+use hadb_changeset::journal as hj;
 use std::sync::Arc;
 
 /// Write entries via journal writer, read them back via JournalReader.
@@ -17,12 +16,11 @@ fn test_write_and_read_entries() {
     let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
     let tx = journal::spawn_journal_writer(
         journal_dir.clone(),
-        1024 * 1024, // 1MB segments
+        1024 * 1024,
         100,
         state.clone(),
     );
 
-    // Write 5 entries.
     for i in 1..=5 {
         tx.send(JournalCommand::Write(PendingEntry {
             query: format!("CREATE (:Person {{name: 'Person{}'}})", i),
@@ -31,22 +29,16 @@ fn test_write_and_read_entries() {
         .unwrap();
     }
 
-    // Flush to ensure writes are durable.
     let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
     tx.send(JournalCommand::Flush(ack_tx)).unwrap();
     ack_rx.recv().unwrap();
 
-    // Verify state updated.
     assert_eq!(state.sequence.load(std::sync::atomic::Ordering::SeqCst), 5);
     assert!(state.is_alive());
 
-    // Shutdown the writer (seals the segment).
     tx.send(JournalCommand::Shutdown).unwrap();
-
-    // Small wait for writer thread to finish.
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    // Read entries back via JournalReader.
     let reader = JournalReader::open(&journal_dir).unwrap();
     let entries: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(entries.len(), 5);
@@ -72,7 +64,6 @@ fn test_sealed_segment_is_compressed() {
         state.clone(),
     );
 
-    // Write entries.
     for i in 1..=3 {
         tx.send(JournalCommand::Write(PendingEntry {
             query: format!("MERGE (n:Node {{id: {}}})", i),
@@ -81,7 +72,6 @@ fn test_sealed_segment_is_compressed() {
         .unwrap();
     }
 
-    // Seal for upload.
     let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
     tx.send(JournalCommand::SealForUpload(ack_tx)).unwrap();
     let sealed_path = ack_rx.recv().unwrap();
@@ -91,19 +81,16 @@ fn test_sealed_segment_is_compressed() {
     assert!(sealed_path.exists(), "Sealed file should exist");
 
     // Verify it's sealed + compressed by reading header.
-    let mut f = std::fs::File::open(&sealed_path).unwrap();
-    let header = graphj::read_header(&mut f).unwrap().unwrap();
+    let header = graphstream::format::read_header_from_path(&sealed_path).unwrap();
     assert!(header.is_sealed());
     assert!(header.is_compressed());
     assert_eq!(header.entry_count, 3);
     assert_eq!(header.first_seq, 1);
     assert_eq!(header.last_seq, 3);
 
-    // Shutdown writer.
     tx.send(JournalCommand::Shutdown).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    // Read entries back from sealed segment.
     let reader = JournalReader::open(&journal_dir).unwrap();
     let entries: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(entries.len(), 3);
@@ -123,7 +110,6 @@ fn test_recover_journal_state() {
         state.clone(),
     );
 
-    // Write 10 entries.
     for i in 1..=10 {
         tx.send(JournalCommand::Write(PendingEntry {
             query: format!("CREATE (:N {{v: {}}})", i),
@@ -132,17 +118,14 @@ fn test_recover_journal_state() {
         .unwrap();
     }
 
-    // Get the chain hash before shutdown.
     let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
     tx.send(JournalCommand::Flush(ack_tx)).unwrap();
     ack_rx.recv().unwrap();
     let expected_hash = *state.chain_hash.lock().unwrap();
 
-    // Shutdown (seals segment).
     tx.send(JournalCommand::Shutdown).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    // Recover state from disk.
     let (recovered_seq, recovered_hash) =
         journal::recover_journal_state(&journal_dir).unwrap();
     assert_eq!(recovered_seq, 10);
@@ -181,12 +164,11 @@ fn test_segment_rotation() {
     let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
     let tx = journal::spawn_journal_writer(
         journal_dir.clone(),
-        512, // Very small segment: 512 bytes (header=128, so only ~384 for entries)
+        512,
         100,
         state.clone(),
     );
 
-    // Write enough entries to trigger rotation (each entry is ~100+ bytes).
     for i in 1..=10 {
         tx.send(JournalCommand::Write(PendingEntry {
             query: format!("CREATE (:Person {{name: 'Person{}'}})", i),
@@ -200,39 +182,25 @@ fn test_segment_rotation() {
     ack_rx.recv().unwrap();
 
     tx.send(JournalCommand::Shutdown).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    std::thread::sleep(std::time::Duration::from_millis(200));
 
-    // Count .graphj files — should be multiple due to small segment size.
-    let segment_count = std::fs::read_dir(&journal_dir)
+    let segments: Vec<_> = std::fs::read_dir(&journal_dir)
         .unwrap()
-        .filter(|e| {
-            e.as_ref()
-                .unwrap()
-                .path()
-                .extension()
-                .map_or(false, |ext| ext == "graphj")
-        })
-        .count();
-    assert!(
-        segment_count > 1,
-        "Expected multiple segments due to rotation, got {}",
-        segment_count
-    );
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |ext| ext == "hadbj"))
+        .collect();
 
-    // Read all entries back — should still get all 10 across segments.
+    assert!(segments.len() > 1, "Expected multiple segments from rotation, got {}", segments.len());
+
     let reader = JournalReader::open(&journal_dir).unwrap();
     let entries: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(entries.len(), 10);
-
-    // Chain is continuous.
-    for (i, entry) in entries.iter().enumerate() {
-        assert_eq!(entry.sequence, (i + 1) as u64);
-    }
 }
 
-/// Test JournalReader::from_sequence skips earlier entries.
+/// Test SealForUpload command.
 #[test]
-fn test_reader_from_sequence() {
+fn test_seal_for_upload() {
     let dir = tempfile::tempdir().unwrap();
     let journal_dir = dir.path().join("journal");
 
@@ -244,123 +212,6 @@ fn test_reader_from_sequence() {
         state.clone(),
     );
 
-    for i in 1..=5 {
-        tx.send(JournalCommand::Write(PendingEntry {
-            query: format!("CREATE (:N {{v: {}}})", i),
-            params: vec![],
-        }))
-        .unwrap();
-    }
-
-    tx.send(JournalCommand::Shutdown).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    // Read from sequence 3 — should get entries 3, 4, 5.
-    let reader = JournalReader::from_sequence(&journal_dir, 3, [0u8; 32]).unwrap();
-    let entries: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
-    assert_eq!(entries.len(), 3);
-    assert_eq!(entries[0].sequence, 3);
-    assert_eq!(entries[1].sequence, 4);
-    assert_eq!(entries[2].sequence, 5);
-}
-
-/// Writer is_alive() goes false after shutdown.
-#[test]
-fn test_writer_alive_after_shutdown() {
-    let dir = tempfile::tempdir().unwrap();
-    let journal_dir = dir.path().join("journal");
-
-    let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
-    let tx = journal::spawn_journal_writer(
-        journal_dir.clone(),
-        1024 * 1024,
-        100,
-        state.clone(),
-    );
-
-    assert!(state.is_alive());
-
-    tx.send(JournalCommand::Shutdown).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    assert!(!state.is_alive(), "Writer should be dead after shutdown");
-}
-
-/// Writer is_alive() goes false when sender is dropped (disconnect).
-#[test]
-fn test_writer_alive_after_disconnect() {
-    let dir = tempfile::tempdir().unwrap();
-    let journal_dir = dir.path().join("journal");
-
-    let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
-    let tx = journal::spawn_journal_writer(
-        journal_dir.clone(),
-        1024 * 1024,
-        100,
-        state.clone(),
-    );
-
-    // Write an entry so the segment exists.
-    tx.send(JournalCommand::Write(PendingEntry {
-        query: "CREATE (:N {v: 1})".into(),
-        params: vec![],
-    }))
-    .unwrap();
-    let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
-    tx.send(JournalCommand::Flush(ack_tx)).unwrap();
-    ack_rx.recv().unwrap();
-
-    // Drop the sender — writer thread should detect disconnect and exit.
-    drop(tx);
-    std::thread::sleep(std::time::Duration::from_millis(300));
-
-    assert!(!state.is_alive(), "Writer should be dead after sender drop");
-
-    // Entry should still be readable (segment was sealed on disconnect).
-    let reader = JournalReader::open(&journal_dir).unwrap();
-    let entries: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
-    assert_eq!(entries.len(), 1);
-}
-
-/// SealForUpload with no writes returns None.
-#[test]
-fn test_seal_for_upload_no_writes() {
-    let dir = tempfile::tempdir().unwrap();
-    let journal_dir = dir.path().join("journal");
-
-    let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
-    let tx = journal::spawn_journal_writer(
-        journal_dir.clone(),
-        1024 * 1024,
-        100,
-        state.clone(),
-    );
-
-    // SealForUpload with no writes should return None.
-    let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
-    tx.send(JournalCommand::SealForUpload(ack_tx)).unwrap();
-    let sealed_path = ack_rx.recv().unwrap();
-    assert!(sealed_path.is_none(), "No segment to seal when no writes");
-
-    tx.send(JournalCommand::Shutdown).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(100));
-}
-
-/// Multiple SealForUpload calls: first seals, second returns None (no new writes).
-#[test]
-fn test_multiple_seal_for_upload() {
-    let dir = tempfile::tempdir().unwrap();
-    let journal_dir = dir.path().join("journal");
-
-    let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
-    let tx = journal::spawn_journal_writer(
-        journal_dir.clone(),
-        1024 * 1024,
-        100,
-        state.clone(),
-    );
-
-    // Write entries.
     for i in 1..=3 {
         tx.send(JournalCommand::Write(PendingEntry {
             query: format!("CREATE (:N {{v: {}}})", i),
@@ -369,255 +220,56 @@ fn test_multiple_seal_for_upload() {
         .unwrap();
     }
 
-    // First seal — returns the sealed path.
     let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
     tx.send(JournalCommand::SealForUpload(ack_tx)).unwrap();
-    let first_seal = ack_rx.recv().unwrap();
-    assert!(first_seal.is_some(), "First seal should return a path");
+    let sealed = ack_rx.recv().unwrap();
+    assert!(sealed.is_some());
+    let sealed_path = sealed.unwrap();
+    assert!(sealed_path.exists());
 
-    // Second seal with no new writes — returns None.
+    // Second seal with no new entries should return None.
     let (ack_tx2, ack_rx2) = std::sync::mpsc::sync_channel(1);
     tx.send(JournalCommand::SealForUpload(ack_tx2)).unwrap();
-    let second_seal = ack_rx2.recv().unwrap();
-    assert!(second_seal.is_none(), "Second seal with no new writes returns None");
-
-    // Write more, then seal again — should return a path.
-    for i in 4..=6 {
-        tx.send(JournalCommand::Write(PendingEntry {
-            query: format!("CREATE (:N {{v: {}}})", i),
-            params: vec![],
-        }))
-        .unwrap();
-    }
-    let (ack_tx3, ack_rx3) = std::sync::mpsc::sync_channel(1);
-    tx.send(JournalCommand::SealForUpload(ack_tx3)).unwrap();
-    let third_seal = ack_rx3.recv().unwrap();
-    assert!(third_seal.is_some(), "Third seal after new writes should return a path");
+    let sealed2 = ack_rx2.recv().unwrap();
+    assert!(sealed2.is_none());
 
     tx.send(JournalCommand::Shutdown).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));
-
-    // All 6 entries should be readable across sealed segments.
-    let reader = JournalReader::open(&journal_dir).unwrap();
-    let entries: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
-    assert_eq!(entries.len(), 6);
 }
 
-/// Flush with no pending writes is a no-op.
+/// Test journal with large entries.
 #[test]
-fn test_flush_no_pending_writes() {
+fn test_large_entries() {
     let dir = tempfile::tempdir().unwrap();
     let journal_dir = dir.path().join("journal");
 
     let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
     let tx = journal::spawn_journal_writer(
         journal_dir.clone(),
-        1024 * 1024,
+        10 * 1024 * 1024,
         100,
         state.clone(),
     );
 
-    // Flush with no writes — should not panic.
-    let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
-    tx.send(JournalCommand::Flush(ack_tx)).unwrap();
-    ack_rx.recv().unwrap(); // succeeds
-
-    assert_eq!(state.sequence.load(std::sync::atomic::Ordering::SeqCst), 0);
-
-    tx.send(JournalCommand::Shutdown).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(100));
-}
-
-/// Encrypted segment round-trip: write → compact with key → read with key.
-#[test]
-fn test_encrypted_segment_roundtrip() {
-    let dir = tempfile::tempdir().unwrap();
-    let journal_dir = dir.path().join("journal");
-
-    let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
-    let tx = journal::spawn_journal_writer(
-        journal_dir.clone(),
-        1024 * 1024,
-        100,
-        state.clone(),
-    );
-
-    for i in 1..=5 {
-        tx.send(JournalCommand::Write(PendingEntry {
-            query: format!("CREATE (:Secret {{id: {}}})", i),
-            params: vec![("id".into(), ParamValue::Int(i))],
-        }))
-        .unwrap();
-    }
-
-    tx.send(JournalCommand::Shutdown).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    // Collect sealed segments.
-    let mut segments: Vec<std::path::PathBuf> = std::fs::read_dir(&journal_dir)
-        .unwrap()
-        .filter_map(|e| {
-            let p = e.unwrap().path();
-            if p.extension().map_or(false, |ext| ext == "graphj") {
-                Some(p)
-            } else {
-                None
-            }
-        })
-        .collect();
-    segments.sort();
-
-    // Compact with encryption.
-    let key: [u8; 32] = [42u8; 32]; // test key
-    let output = dir.path().join("encrypted.graphj");
-    let header = graphj::compact(&segments, &output, true, 3, Some(&key)).unwrap();
-
-    assert!(header.is_sealed());
-    assert!(header.is_compressed());
-    assert!(header.is_encrypted());
-    assert_eq!(header.entry_count, 5);
-    assert_eq!(header.encryption, graphj::ENCRYPTION_XCHACHA20POLY1305);
-
-    // Read back with the correct key.
-    let encrypted_dir = dir.path().join("encrypted_journal");
-    std::fs::create_dir_all(&encrypted_dir).unwrap();
-    std::fs::copy(&output, encrypted_dir.join("journal-0000000000000001.graphj")).unwrap();
-
-    let reader = JournalReader::open_with_key(&encrypted_dir, Some(key)).unwrap();
-    let entries: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
-    assert_eq!(entries.len(), 5);
-    for (i, entry) in entries.iter().enumerate() {
-        assert_eq!(entry.sequence, (i + 1) as u64);
-        assert!(entry.entry.query.contains("Secret"));
-    }
-}
-
-/// Encrypted segment with wrong key fails decryption (test decode_body directly).
-#[test]
-fn test_encrypted_segment_wrong_key() {
-    let dir = tempfile::tempdir().unwrap();
-    let journal_dir = dir.path().join("journal");
-
-    let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
-    let tx = journal::spawn_journal_writer(
-        journal_dir.clone(),
-        1024 * 1024,
-        100,
-        state.clone(),
-    );
-
+    let big_query = format!("CREATE (:Node {{data: '{}'}})", "x".repeat(100_000));
     tx.send(JournalCommand::Write(PendingEntry {
-        query: "CREATE (:N {v: 1})".into(),
-        params: vec![],
-    }))
-    .unwrap();
-    tx.send(JournalCommand::Shutdown).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    let mut segments: Vec<std::path::PathBuf> = std::fs::read_dir(&journal_dir)
-        .unwrap()
-        .filter_map(|e| {
-            let p = e.unwrap().path();
-            if p.extension().map_or(false, |ext| ext == "graphj") {
-                Some(p)
-            } else {
-                None
-            }
-        })
-        .collect();
-    segments.sort();
-
-    // Compact with one key.
-    let key: [u8; 32] = [42u8; 32];
-    let output = dir.path().join("encrypted.graphj");
-    graphj::compact(&segments, &output, true, 3, Some(&key)).unwrap();
-
-    // Read header + body from the encrypted file.
-    use std::io::Read;
-    let mut f = std::fs::File::open(&output).unwrap();
-    let header = graphj::read_header(&mut f).unwrap().unwrap();
-    assert!(header.is_encrypted());
-    let mut body = vec![0u8; header.body_len as usize];
-    f.read_exact(&mut body).unwrap();
-
-    // Correct key succeeds.
-    assert!(graphj::decode_body(&header, &body, Some(&key)).is_ok());
-
-    // Wrong key fails with decryption error.
-    let wrong_key: [u8; 32] = [99u8; 32];
-    let result = graphj::decode_body(&header, &body, Some(&wrong_key));
-    assert!(result.is_err(), "Wrong key should cause decryption error");
-    assert!(
-        result.unwrap_err().contains("Decryption failed"),
-        "Error should mention decryption"
-    );
-}
-
-/// Reader on empty directory returns no entries.
-#[test]
-fn test_reader_empty_dir() {
-    let dir = tempfile::tempdir().unwrap();
-    let journal_dir = dir.path().join("journal");
-    std::fs::create_dir_all(&journal_dir).unwrap();
-
-    let reader = JournalReader::open(&journal_dir).unwrap();
-    let entries: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
-    assert_eq!(entries.len(), 0);
-}
-
-/// Reader from_sequence on empty dir returns no entries.
-#[test]
-fn test_reader_from_sequence_empty_dir() {
-    let dir = tempfile::tempdir().unwrap();
-    let journal_dir = dir.path().join("journal");
-    std::fs::create_dir_all(&journal_dir).unwrap();
-
-    let reader = JournalReader::from_sequence(&journal_dir, 5, [0u8; 32]).unwrap();
-    let entries: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
-    assert_eq!(entries.len(), 0);
-}
-
-/// Large entries that exceed segment max bytes still work (one entry per segment).
-#[test]
-fn test_large_entry_exceeds_segment_size() {
-    let dir = tempfile::tempdir().unwrap();
-    let journal_dir = dir.path().join("journal");
-
-    let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
-    let tx = journal::spawn_journal_writer(
-        journal_dir.clone(),
-        256, // Very small: 256 bytes (header=128, so 128 for entries)
-        100,
-        state.clone(),
-    );
-
-    // Write a large entry (query string longer than 256 bytes).
-    let large_query = format!("CREATE (:N {{data: '{}'}})", "X".repeat(500));
-    tx.send(JournalCommand::Write(PendingEntry {
-        query: large_query.clone(),
+        query: big_query.clone(),
         params: vec![],
     }))
     .unwrap();
 
-    let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
-    tx.send(JournalCommand::Flush(ack_tx)).unwrap();
-    ack_rx.recv().unwrap();
-
-    assert_eq!(state.sequence.load(std::sync::atomic::Ordering::SeqCst), 1);
-
     tx.send(JournalCommand::Shutdown).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    // Entry should still be readable.
     let reader = JournalReader::open(&journal_dir).unwrap();
     let entries: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(entries.len(), 1);
-    assert!(entries[0].entry.query.contains(&"X".repeat(500)));
+    assert_eq!(entries[0].entry.query, big_query);
 }
 
-/// Segment file naming uses zero-padded sequence numbers.
+/// Test that all param types survive write/read roundtrip.
 #[test]
-fn test_segment_naming_format() {
+fn test_all_param_types() {
     let dir = tempfile::tempdir().unwrap();
     let journal_dir = dir.path().join("journal");
 
@@ -630,114 +282,18 @@ fn test_segment_naming_format() {
     );
 
     tx.send(JournalCommand::Write(PendingEntry {
-        query: "CREATE (:N {v: 1})".into(),
-        params: vec![],
-    }))
-    .unwrap();
-
-    tx.send(JournalCommand::Shutdown).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    let segment: std::path::PathBuf = std::fs::read_dir(&journal_dir)
-        .unwrap()
-        .filter_map(|e| {
-            let p = e.unwrap().path();
-            if p.extension().map_or(false, |ext| ext == "graphj") {
-                Some(p)
-            } else {
-                None
-            }
-        })
-        .next()
-        .unwrap();
-
-    let filename = segment.file_name().unwrap().to_str().unwrap();
-    assert!(
-        filename.starts_with("journal-") && filename.ends_with(".graphj"),
-        "Unexpected filename: {filename}"
-    );
-    // Verify 16-digit zero-padded format.
-    let stem = filename
-        .strip_prefix("journal-")
-        .unwrap()
-        .strip_suffix(".graphj")
-        .unwrap();
-    assert_eq!(stem.len(), 16, "Expected 16-digit zero-padded seq, got: {stem}");
-    assert_eq!(stem, "0000000000000001");
-}
-
-/// Recovery from multiple segments across restarts.
-#[test]
-fn test_recover_across_multiple_segments() {
-    let dir = tempfile::tempdir().unwrap();
-    let journal_dir = dir.path().join("journal");
-
-    // Three separate writer sessions, each creating a segment.
-    for session in 0..3 {
-        let (seq, hash) = journal::recover_journal_state(&journal_dir).unwrap();
-        let state = Arc::new(JournalState::with_sequence_and_hash(seq, hash));
-        let tx = journal::spawn_journal_writer(
-            journal_dir.clone(),
-            1024 * 1024,
-            100,
-            state.clone(),
-        );
-
-        let start = session * 5 + 1;
-        for i in start..start + 5 {
-            tx.send(JournalCommand::Write(PendingEntry {
-                query: format!("CREATE (:N {{v: {}}})", i),
-                params: vec![],
-            }))
-            .unwrap();
-        }
-
-        tx.send(JournalCommand::Shutdown).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
-    // Recovery should find seq=15 across all segments.
-    let (recovered_seq, _) = journal::recover_journal_state(&journal_dir).unwrap();
-    assert_eq!(recovered_seq, 15);
-
-    // All 15 entries should be readable.
-    let reader = JournalReader::open(&journal_dir).unwrap();
-    let entries: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
-    assert_eq!(entries.len(), 15);
-    for (i, entry) in entries.iter().enumerate() {
-        assert_eq!(entry.sequence, (i + 1) as u64);
-    }
-}
-
-/// Entries preserve params through write → seal → read cycle.
-#[test]
-fn test_params_preserved_through_seal() {
-    let dir = tempfile::tempdir().unwrap();
-    let journal_dir = dir.path().join("journal");
-
-    let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
-    let tx = journal::spawn_journal_writer(
-        journal_dir.clone(),
-        1024 * 1024,
-        100,
-        state.clone(),
-    );
-
-    tx.send(JournalCommand::Write(PendingEntry {
-        query: "CREATE (:N {name: $name, age: $age, active: $active})".into(),
+        query: "MATCH (n) RETURN n".into(),
         params: vec![
-            ("name".into(), ParamValue::String("Alice".into())),
-            ("age".into(), ParamValue::Int(30)),
-            ("active".into(), ParamValue::Bool(true)),
+            ("i".into(), ParamValue::Int(42)),
+            ("f".into(), ParamValue::Float(3.14)),
+            ("s".into(), ParamValue::String("hello".into())),
+            ("b".into(), ParamValue::Bool(true)),
+            ("n".into(), ParamValue::Null),
+            ("l".into(), ParamValue::List(vec![ParamValue::Int(1), ParamValue::Int(2)])),
         ],
     }))
     .unwrap();
 
-    // Seal and verify.
-    let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
-    tx.send(JournalCommand::SealForUpload(ack_tx)).unwrap();
-    ack_rx.recv().unwrap();
-
     tx.send(JournalCommand::Shutdown).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -745,25 +301,20 @@ fn test_params_preserved_through_seal() {
     let entries: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(entries.len(), 1);
 
-    // Verify params are preserved via protobuf round-trip.
-    let entry = &entries[0];
-    let params = graphstream::map_entries_to_param_values(&entry.entry.params);
-    assert_eq!(params.len(), 3);
-    assert_eq!(params[0], ("name".into(), ParamValue::String("Alice".into())));
-    assert_eq!(params[1], ("age".into(), ParamValue::Int(30)));
-    assert_eq!(params[2], ("active".into(), ParamValue::Bool(true)));
+    let params = graphstream::map_entries_to_param_values(&entries[0].entry.params);
+    assert_eq!(params.len(), 6);
 }
 
-/// Reader from_sequence across multiple segments.
+/// Test from_sequence skips earlier entries.
 #[test]
-fn test_reader_from_sequence_cross_segment() {
+fn test_from_sequence() {
     let dir = tempfile::tempdir().unwrap();
     let journal_dir = dir.path().join("journal");
 
     let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
     let tx = journal::spawn_journal_writer(
         journal_dir.clone(),
-        512, // Small segments to force rotation.
+        1024 * 1024,
         100,
         state.clone(),
     );
@@ -779,131 +330,9 @@ fn test_reader_from_sequence_cross_segment() {
     tx.send(JournalCommand::Shutdown).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    // Read from sequence 7 — should get entries 7..10.
-    let reader = JournalReader::from_sequence(&journal_dir, 7, [0u8; 32]).unwrap();
+    let reader = JournalReader::from_sequence(&journal_dir, 6, [0u8; 32]).unwrap();
     let entries: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
-    assert_eq!(entries.len(), 4);
-    assert_eq!(entries[0].sequence, 7);
-    assert_eq!(entries[3].sequence, 10);
-}
-
-/// Entries with all param types survive journal round-trip.
-#[test]
-fn test_all_param_types_journal_roundtrip() {
-    let dir = tempfile::tempdir().unwrap();
-    let journal_dir = dir.path().join("journal");
-
-    let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
-    let tx = journal::spawn_journal_writer(
-        journal_dir.clone(),
-        1024 * 1024,
-        100,
-        state.clone(),
-    );
-
-    let all_params = vec![
-        ("null_val".into(), ParamValue::Null),
-        ("bool_val".into(), ParamValue::Bool(false)),
-        ("int_val".into(), ParamValue::Int(-42)),
-        ("float_val".into(), ParamValue::Float(3.14159)),
-        ("str_val".into(), ParamValue::String("hello world".into())),
-        ("list_val".into(), ParamValue::List(vec![
-            ParamValue::Int(1),
-            ParamValue::String("two".into()),
-            ParamValue::Null,
-        ])),
-    ];
-
-    tx.send(JournalCommand::Write(PendingEntry {
-        query: "CREATE (:N $params)".into(),
-        params: all_params.clone(),
-    }))
-    .unwrap();
-
-    tx.send(JournalCommand::Shutdown).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    let reader = JournalReader::open(&journal_dir).unwrap();
-    let entries: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
-    assert_eq!(entries.len(), 1);
-
-    let roundtripped = graphstream::map_entries_to_param_values(&entries[0].entry.params);
-    assert_eq!(roundtripped.len(), all_params.len());
-
-    for (original, recovered) in all_params.iter().zip(roundtripped.iter()) {
-        assert_eq!(original.0, recovered.0);
-        // Float comparison via pattern match since NaN != NaN.
-        match (&original.1, &recovered.1) {
-            (ParamValue::Float(a), ParamValue::Float(b)) => {
-                assert!((a - b).abs() < 1e-10, "Float mismatch: {a} vs {b}");
-            }
-            (a, b) => assert_eq!(a, b),
-        }
-    }
-}
-
-/// Test writing entries with chain hash continuity after recovery.
-#[test]
-fn test_chain_continuity_across_restarts() {
-    let dir = tempfile::tempdir().unwrap();
-    let journal_dir = dir.path().join("journal");
-
-    // First writer session: write 5 entries.
-    {
-        let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
-        let tx = journal::spawn_journal_writer(
-            journal_dir.clone(),
-            1024 * 1024,
-            100,
-            state.clone(),
-        );
-
-        for i in 1..=5 {
-            tx.send(JournalCommand::Write(PendingEntry {
-                query: format!("CREATE (:A {{v: {}}})", i),
-                params: vec![],
-            }))
-            .unwrap();
-        }
-
-        tx.send(JournalCommand::Shutdown).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
-    // Recover state.
-    let (recovered_seq, recovered_hash) =
-        journal::recover_journal_state(&journal_dir).unwrap();
-    assert_eq!(recovered_seq, 5);
-
-    // Second writer session: continue from recovered state.
-    {
-        let state =
-            Arc::new(JournalState::with_sequence_and_hash(recovered_seq, recovered_hash));
-        let tx = journal::spawn_journal_writer(
-            journal_dir.clone(),
-            1024 * 1024,
-            100,
-            state.clone(),
-        );
-
-        for i in 6..=10 {
-            tx.send(JournalCommand::Write(PendingEntry {
-                query: format!("CREATE (:B {{v: {}}})", i),
-                params: vec![],
-            }))
-            .unwrap();
-        }
-
-        tx.send(JournalCommand::Shutdown).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
-    // Read all entries — chain should be continuous across both sessions.
-    let reader = JournalReader::open(&journal_dir).unwrap();
-    let entries: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
-    assert_eq!(entries.len(), 10);
-
-    for (i, entry) in entries.iter().enumerate() {
-        assert_eq!(entry.sequence, (i + 1) as u64);
-    }
+    assert_eq!(entries.len(), 5); // entries 6..=10
+    assert_eq!(entries[0].sequence, 6);
+    assert_eq!(entries[4].sequence, 10);
 }

@@ -107,6 +107,7 @@ pub struct UploaderStats {
 struct UploadTaskContext {
     storage: Arc<dyn SegmentStorage>,
     prefix: String,
+    db_name: String,
     retry_policy: Arc<RetryPolicy>,
     stats: Arc<tokio::sync::Mutex<UploaderStats>>,
     cache: Option<Arc<tokio::sync::Mutex<crate::cache::SegmentCache>>>,
@@ -131,7 +132,17 @@ impl UploadTaskContext {
             .and_then(|n| n.to_str())
             .ok_or_else(|| anyhow!("Invalid segment path: {}", path.display()))?
             .to_string();
-        let key = format!("{}journal/{}", self.prefix, file_name);
+
+        // Parse seq from filename (journal-{seq:016}.hadbj or compacted-{ts}.hadbj).
+        let seq = parse_seq_from_filename(&file_name)
+            .ok_or_else(|| anyhow!("Cannot parse seq from filename: {}", file_name))?;
+        let key = hadb_changeset::storage::format_key(
+            &self.prefix,
+            &self.db_name,
+            hadb_changeset::storage::GENERATION_INCREMENTAL,
+            seq,
+            hadb_changeset::storage::ChangesetKind::Journal,
+        );
 
         // Get file size before upload for stats tracking.
         let data_len = std::fs::metadata(&path)
@@ -205,25 +216,28 @@ impl Uploader {
     pub fn new(
         storage: Arc<dyn SegmentStorage>,
         prefix: String,
+        db_name: String,
         retry_policy: Arc<RetryPolicy>,
         max_concurrent: usize,
     ) -> Self {
-        Self::with_options(storage, prefix, retry_policy, max_concurrent, None, None)
+        Self::with_options(storage, prefix, db_name, retry_policy, max_concurrent, None, None)
     }
 
     pub fn with_cache(
         storage: Arc<dyn SegmentStorage>,
         prefix: String,
+        db_name: String,
         retry_policy: Arc<RetryPolicy>,
         max_concurrent: usize,
         cache: Option<Arc<tokio::sync::Mutex<crate::cache::SegmentCache>>>,
     ) -> Self {
-        Self::with_options(storage, prefix, retry_policy, max_concurrent, cache, None)
+        Self::with_options(storage, prefix, db_name, retry_policy, max_concurrent, cache, None)
     }
 
     pub fn with_options(
         storage: Arc<dyn SegmentStorage>,
         prefix: String,
+        db_name: String,
         retry_policy: Arc<RetryPolicy>,
         max_concurrent: usize,
         cache: Option<Arc<tokio::sync::Mutex<crate::cache::SegmentCache>>>,
@@ -233,6 +247,7 @@ impl Uploader {
             ctx: UploadTaskContext {
                 storage,
                 prefix,
+                db_name,
                 retry_policy,
                 stats: Arc::new(tokio::sync::Mutex::new(UploaderStats::default())),
                 cache,
@@ -343,6 +358,7 @@ pub fn spawn_journal_uploader(
     journal_dir: PathBuf,
     object_store: Arc<dyn hadb_io::ObjectStore>,
     prefix: String,
+    db_name: String,
     interval: Duration,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> (mpsc::Sender<UploadMessage>, tokio::task::JoinHandle<()>) {
@@ -351,6 +367,7 @@ pub fn spawn_journal_uploader(
         journal_dir,
         object_store,
         prefix,
+        db_name,
         interval,
         shutdown,
         RetryPolicy::default_policy(),
@@ -364,6 +381,7 @@ pub fn spawn_journal_uploader_with_retry(
     journal_dir: PathBuf,
     object_store: Arc<dyn hadb_io::ObjectStore>,
     prefix: String,
+    db_name: String,
     interval: Duration,
     shutdown: tokio::sync::watch::Receiver<bool>,
     retry_policy: RetryPolicy,
@@ -374,6 +392,7 @@ pub fn spawn_journal_uploader_with_retry(
         journal_dir,
         object_store,
         prefix,
+        db_name,
         interval,
         shutdown,
         retry_policy,
@@ -390,6 +409,7 @@ pub fn spawn_journal_uploader_with_cache(
     journal_dir: PathBuf,
     object_store: Arc<dyn hadb_io::ObjectStore>,
     prefix: String,
+    db_name: String,
     interval: Duration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     retry_policy: RetryPolicy,
@@ -414,6 +434,7 @@ pub fn spawn_journal_uploader_with_cache(
         let uploader = Arc::new(Uploader::with_options(
             storage,
             prefix.clone(),
+            db_name,
             retry_policy.clone(),
             max_concurrent,
             cache.clone(),
@@ -522,7 +543,7 @@ pub fn spawn_journal_uploader_with_cache(
                 info!(segment = %path.display(), "Sealed segment for upload");
             }
 
-            // 2. Scan for sealed .graphj files, skip already-uploaded, send Upload messages.
+            // 2. Scan for sealed .hadbj files, skip already-uploaded, send Upload messages.
             match scan_sealed_segments(&journal_dir) {
                 Ok(paths) => {
                     for path in paths {
@@ -551,7 +572,19 @@ pub fn spawn_journal_uploader_with_cache(
     (upload_tx, handle)
 }
 
-/// Scan journal_dir for sealed .graphj files. Returns their paths.
+/// Parse sequence number from a journal segment filename.
+/// Handles both "journal-{seq:016}.hadbj" and "compacted-{timestamp}.hadbj".
+fn parse_seq_from_filename(filename: &str) -> Option<u64> {
+    if let Some(stem) = filename.strip_prefix("journal-").and_then(|s| s.strip_suffix(".hadbj")) {
+        return stem.parse::<u64>().ok();
+    }
+    if let Some(stem) = filename.strip_prefix("compacted-").and_then(|s| s.strip_suffix(".hadbj")) {
+        return stem.parse::<u64>().ok();
+    }
+    None
+}
+
+/// Scan journal_dir for sealed .hadbj files. Returns their paths.
 fn scan_sealed_segments(journal_dir: &Path) -> Result<Vec<PathBuf>> {
     let entries = std::fs::read_dir(journal_dir)
         .map_err(|e| anyhow!("Read journal dir: {e}"))?;
@@ -562,12 +595,12 @@ fn scan_sealed_segments(journal_dir: &Path) -> Result<Vec<PathBuf>> {
         let path = entry.path();
 
         let _name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) if n.ends_with(".graphj") => n.to_string(),
+            Some(n) if n.ends_with(".hadbj") => n.to_string(),
             _ => continue,
         };
 
         // Skip non-sealed files.
-        if !crate::graphj::is_file_sealed(&path).map_err(|e| anyhow!("{e}"))? {
+        if !crate::format::is_file_sealed(&path).map_err(|e| anyhow!("{e}"))? {
             continue;
         }
 
@@ -618,7 +651,7 @@ pub async fn run_background_compaction(
             for entry in entries.flatten() {
                 let path = entry.path();
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.ends_with(".graphj")
+                    if name.ends_with(".hadbj")
                         && !name.starts_with("compacted-")
                         && cache_guard.is_uploaded(name)
                     {
@@ -645,18 +678,51 @@ pub async fn run_background_compaction(
     let dir = journal_dir.to_path_buf();
     let zstd_level = config.zstd_level;
     let compacted_path = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+        use hadb_changeset::journal::{decode, decode_entry, decode_header, seal, encode_compressed, HEADER_SIZE, HADBJ_MAGIC, JournalEntry as HjEntry};
+
         let output = dir.join(format!(
-            "compacted-{}.graphj",
+            "compacted-{}.hadbj",
             crate::current_timestamp_ms()
         ));
-        crate::graphj::compact_streaming(
-            &paths.iter().map(|p| p.as_path()).collect::<Vec<_>>(),
-            &output,
-            true,
-            zstd_level,
-            None,
-        )
-        .map_err(|e| anyhow!("Compaction failed: {e}"))?;
+
+        // Read all entries from input segments.
+        let mut all_entries: Vec<HjEntry> = Vec::new();
+        for path in &paths {
+            let file_bytes = std::fs::read(path)
+                .map_err(|e| anyhow!("Read {}: {e}", path.display()))?;
+            if file_bytes.len() < HEADER_SIZE || file_bytes[0..5] != HADBJ_MAGIC {
+                continue;
+            }
+            let header = decode_header(&file_bytes)
+                .map_err(|e| anyhow!("Decode header {}: {e}", path.display()))?;
+            if header.is_sealed() {
+                let segment = decode(&file_bytes)
+                    .map_err(|e| anyhow!("Decode segment {}: {e}", path.display()))?;
+                all_entries.extend(segment.entries);
+            } else {
+                let body = &file_bytes[HEADER_SIZE..];
+                let mut offset = 0;
+                while offset < body.len() {
+                    match decode_entry(body, offset) {
+                        Ok((entry, consumed)) => {
+                            all_entries.push(entry);
+                            offset += consumed;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+
+        if all_entries.is_empty() {
+            return Err(anyhow!("No entries found in input segments"));
+        }
+
+        let segment = seal(all_entries, 0);
+        let encoded = encode_compressed(&segment, zstd_level);
+        std::fs::write(&output, &encoded)
+            .map_err(|e| anyhow!("Write compacted: {e}"))?;
+
         Ok(output)
     })
     .await
@@ -768,7 +834,8 @@ mod tests {
     ) -> Arc<Uploader> {
         Arc::new(Uploader::new(
             storage,
-            "test/db/".to_string(),
+            "test/".to_string(),
+            "db".to_string(),
             Arc::new(RetryPolicy::default_policy()),
             max_concurrent,
         ))
@@ -788,7 +855,7 @@ mod tests {
         let (tx, handle) = spawn_uploader(uploader);
 
         let dir = tempfile::tempdir().unwrap();
-        let path = write_fake_segment(dir.path(), "seg-0001.graphj", b"segment data");
+        let path = write_fake_segment(dir.path(), "journal-0000000000000001.hadbj", b"segment data");
 
         tx.send(UploadMessage::Upload(path)).await.unwrap();
         tx.send(UploadMessage::Shutdown).await.unwrap();
@@ -796,7 +863,7 @@ mod tests {
         timeout(Duration::from_secs(5), handle).await.unwrap().unwrap();
 
         assert_eq!(storage.object_count(), 1);
-        assert!(storage.has_key("test/db/journal/seg-0001.graphj"));
+        assert!(storage.has_key("test/db/0000/0000000000000001.hadbj"));
     }
 
     #[tokio::test]
@@ -807,7 +874,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         for i in 0..10 {
-            let name = format!("seg-{:04}.graphj", i);
+            let name = format!("journal-{:016}.hadbj", i);
             let path = write_fake_segment(dir.path(), &name, format!("data-{}", i).as_bytes());
             tx.send(UploadMessage::Upload(path)).await.unwrap();
         }
@@ -826,7 +893,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         for i in 0..9 {
-            let name = format!("seg-{:04}.graphj", i);
+            let name = format!("journal-{:016}.hadbj", i);
             let path = write_fake_segment(dir.path(), &name, format!("data-{}", i).as_bytes());
             tx.send(UploadMessage::Upload(path)).await.unwrap();
         }
@@ -857,7 +924,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let start_seq = tokio::time::Instant::now();
         for i in 0..4 {
-            let path = write_fake_segment(dir.path(), &format!("s-{i}.graphj"), b"data");
+            let path = write_fake_segment(dir.path(), &format!("journal-{:016}.hadbj", i + 100), b"data");
             tx_seq.send(UploadMessage::Upload(path)).await.unwrap();
         }
         tx_seq.send(UploadMessage::Shutdown).await.unwrap();
@@ -872,7 +939,7 @@ mod tests {
         let dir2 = tempfile::tempdir().unwrap();
         let start_con = tokio::time::Instant::now();
         for i in 0..4 {
-            let path = write_fake_segment(dir2.path(), &format!("c-{i}.graphj"), b"data");
+            let path = write_fake_segment(dir2.path(), &format!("journal-{:016}.hadbj", i + 200), b"data");
             tx_con.send(UploadMessage::Upload(path)).await.unwrap();
         }
         tx_con.send(UploadMessage::Shutdown).await.unwrap();
@@ -899,7 +966,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         for i in 0..4 {
-            let path = write_fake_segment(dir.path(), &format!("seg-{i}.graphj"), b"data");
+            let path = write_fake_segment(dir.path(), &format!("journal-{:016}.hadbj", i + 300), b"data");
             tx.send(UploadMessage::Upload(path)).await.unwrap();
         }
 
@@ -922,7 +989,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         for i in 0..3 {
-            let path = write_fake_segment(dir.path(), &format!("seg-{i}.graphj"), b"data");
+            let path = write_fake_segment(dir.path(), &format!("journal-{:016}.hadbj", i + 300), b"data");
             tx.send(UploadMessage::Upload(path)).await.unwrap();
         }
         tx.send(UploadMessage::Shutdown).await.unwrap();
@@ -941,7 +1008,7 @@ mod tests {
         let (tx, handle) = spawn_uploader(uploader);
 
         let dir = tempfile::tempdir().unwrap();
-        let path = write_fake_segment(dir.path(), "seg.graphj", b"data");
+        let path = write_fake_segment(dir.path(), "journal-0000000000000500.hadbj", b"data");
         tx.send(UploadMessage::Upload(path)).await.unwrap();
 
         // Drop sender instead of sending Shutdown.
@@ -961,7 +1028,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data = b"segment-payload-bytes";
         for i in 0..5 {
-            let path = write_fake_segment(dir.path(), &format!("seg-{i}.graphj"), data);
+            let path = write_fake_segment(dir.path(), &format!("journal-{:016}.hadbj", i + 300), data);
             tx.send(UploadMessage::Upload(path)).await.unwrap();
         }
         tx.send(UploadMessage::Shutdown).await.unwrap();
@@ -982,7 +1049,7 @@ mod tests {
         let (tx, handle) = spawn_uploader(uploader);
 
         let dir = tempfile::tempdir().unwrap();
-        let path = write_fake_segment(dir.path(), "seg-ack-ok.graphj", b"ack data");
+        let path = write_fake_segment(dir.path(), "journal-0000000000000600.hadbj", b"ack data");
 
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         tx.send(UploadMessage::UploadWithAck(path, ack_tx))
@@ -1000,7 +1067,7 @@ mod tests {
         timeout(Duration::from_secs(5), handle).await.unwrap().unwrap();
 
         assert_eq!(storage.object_count(), 1);
-        assert!(storage.has_key("test/db/journal/seg-ack-ok.graphj"));
+        assert!(storage.has_key("test/db/0000/0000000000000258.hadbj"));
     }
 
     #[tokio::test]
@@ -1019,14 +1086,15 @@ mod tests {
         };
         let uploader = Arc::new(Uploader::new(
             storage.clone(),
-            "test/db/".to_string(),
+            "test/".to_string(),
+            "db".to_string(),
             Arc::new(RetryPolicy::new(no_retry)),
             4,
         ));
         let (tx, handle) = spawn_uploader(uploader);
 
         let dir = tempfile::tempdir().unwrap();
-        let path = write_fake_segment(dir.path(), "seg-ack-fail.graphj", b"fail data");
+        let path = write_fake_segment(dir.path(), "journal-0000000000000700.hadbj", b"fail data");
 
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         tx.send(UploadMessage::UploadWithAck(path, ack_tx))
@@ -1056,18 +1124,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         // Fire-and-forget upload.
-        let path1 = write_fake_segment(dir.path(), "seg-ff.graphj", b"ff data");
+        let path1 = write_fake_segment(dir.path(), "journal-0000000000000801.hadbj", b"ff data");
         tx.send(UploadMessage::Upload(path1)).await.unwrap();
 
         // Ack upload.
-        let path2 = write_fake_segment(dir.path(), "seg-ack.graphj", b"ack data");
+        let path2 = write_fake_segment(dir.path(), "journal-0000000000000802.hadbj", b"ack data");
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         tx.send(UploadMessage::UploadWithAck(path2, ack_tx))
             .await
             .unwrap();
 
         // Another fire-and-forget.
-        let path3 = write_fake_segment(dir.path(), "seg-ff2.graphj", b"ff2 data");
+        let path3 = write_fake_segment(dir.path(), "journal-0000000000000803.hadbj", b"ff2 data");
         tx.send(UploadMessage::Upload(path3)).await.unwrap();
 
         // Wait for ack.
@@ -1196,7 +1264,7 @@ mod tests {
         }
 
         // Create a fake "compacted-" file to verify it's excluded from compaction input.
-        let fake_compacted = journal_dir.join("compacted-0000000000.graphj");
+        let fake_compacted = journal_dir.join("compacted-0000000000.hadbj");
         std::fs::write(&fake_compacted, b"fake").unwrap();
 
         let cache = Arc::new(tokio::sync::Mutex::new(cache));
@@ -1214,7 +1282,7 @@ mod tests {
         match upload_rx.try_recv() {
             Ok(UploadMessage::Upload(path)) => {
                 let name = path.file_name().unwrap().to_str().unwrap();
-                assert_ne!(name, "compacted-0000000000.graphj");
+                assert_ne!(name, "compacted-0000000000.hadbj");
                 assert!(name.starts_with("compacted-"));
             }
             other => panic!("Expected Upload message, got: {other:?}"),
@@ -1281,7 +1349,7 @@ mod tests {
         storage.upload_bytes("test/key1", b"hello".to_vec()).await.unwrap();
 
         let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("segment.graphj");
+        let file_path = dir.path().join("segment.hadbj");
         std::fs::write(&file_path, b"file-content").unwrap();
         storage.upload_file("test/key2", &file_path).await.unwrap();
 
@@ -1305,6 +1373,7 @@ mod tests {
         let uploader = Arc::new(Uploader::new(
             storage.clone(),
             "test/".to_string(),
+            "db".to_string(),
             Arc::new(RetryPolicy::new(no_retry)),
             4,
         ));
@@ -1313,7 +1382,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         for i in 0..3 {
-            let path = write_fake_segment(dir.path(), &format!("fail-{i}.graphj"), b"data");
+            let path = write_fake_segment(dir.path(), &format!("journal-{:016}.hadbj", i + 900), b"data");
             tx.send(UploadMessage::Upload(path)).await.unwrap();
         }
         tx.send(UploadMessage::Shutdown).await.unwrap();
@@ -1336,6 +1405,7 @@ mod tests {
         let uploader = Arc::new(Uploader::new(
             storage.clone(),
             "db/".to_string(),
+            "mydb".to_string(),
             Arc::new(RetryPolicy::default_policy()),
             4,
         ));
@@ -1343,7 +1413,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         for i in 0..5 {
-            let path = write_fake_segment(dir.path(), &format!("seg-{i}.graphj"), b"data");
+            let path = write_fake_segment(dir.path(), &format!("journal-{:016}.hadbj", i + 1000), b"data");
             tx.send(UploadMessage::Upload(path)).await.unwrap();
         }
         tx.send(UploadMessage::Shutdown).await.unwrap();
@@ -1351,7 +1421,9 @@ mod tests {
         timeout(Duration::from_secs(5), handle).await.unwrap().unwrap();
 
         assert_eq!(storage.object_count(), 5);
-        assert!(storage.has_key("db/journal/seg-0.graphj"));
-        assert!(storage.has_key("db/journal/seg-4.graphj"));
+        // seq 1000 = 0x3e8
+        assert!(storage.has_key("db/mydb/0000/00000000000003e8.hadbj"));
+        // seq 1004 = 0x3ec
+        assert!(storage.has_key("db/mydb/0000/00000000000003ec.hadbj"));
     }
 }

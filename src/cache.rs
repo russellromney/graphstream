@@ -139,7 +139,7 @@ impl SegmentCache {
         Ok(())
     }
 
-    /// Get sealed .graphj files NOT yet marked as uploaded.
+    /// Get sealed .hadbj files NOT yet marked as uploaded.
     pub fn pending_segments(&self) -> Result<Vec<PathBuf>> {
         let mut pending = Vec::new();
         for entry in std::fs::read_dir(&self.journal_dir)
@@ -148,7 +148,7 @@ impl SegmentCache {
             let entry = entry.map_err(|e| anyhow!("Read dir entry: {e}"))?;
             let path = entry.path();
             let name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) if n.ends_with(".graphj") => n.to_string(),
+                Some(n) if n.ends_with(".hadbj") => n.to_string(),
                 _ => continue,
             };
 
@@ -157,7 +157,7 @@ impl SegmentCache {
             }
 
             // Check if sealed.
-            if crate::graphj::is_file_sealed(&path).map_err(|e| anyhow!("{e}"))? {
+            if crate::format::is_file_sealed(&path).map_err(|e| anyhow!("{e}"))? {
                 pending.push(path);
             }
         }
@@ -247,14 +247,14 @@ impl SegmentCache {
             let entry = entry.map_err(|e| anyhow!("Read dir entry: {e}"))?;
             let path = entry.path();
             let name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) if n.ends_with(".graphj") => n.to_string(),
+                Some(n) if n.ends_with(".hadbj") => n.to_string(),
                 _ => continue,
             };
             if let Ok(meta) = std::fs::metadata(&path) {
                 total_bytes += meta.len();
             }
             if !self.manifest.uploaded.contains(&name) {
-                if crate::graphj::is_file_sealed(&path).unwrap_or(false) {
+                if crate::format::is_file_sealed(&path).unwrap_or(false) {
                     pending_count += 1;
                 }
             }
@@ -281,7 +281,7 @@ impl SegmentCache {
             let entry = entry.map_err(|e| anyhow!("Read dir entry: {e}"))?;
             let path = entry.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".graphj") {
+                if name.ends_with(".hadbj") {
                     names.insert(name.to_string());
                 }
             }
@@ -318,15 +318,23 @@ impl SegmentCache {
 mod tests {
     use super::*;
 
-    /// Create a fake sealed segment (128-byte header with sealed flag + body).
+    /// Create a fake sealed segment (128-byte hadbj header with sealed flag + body).
     fn write_fake_sealed_segment(dir: &Path, name: &str, body_size: usize) -> PathBuf {
-        use crate::graphj;
+        use hadb_changeset::journal::{encode_header, JournalHeader, FLAG_SEALED};
 
         let path = dir.join(name);
-        let mut header = graphj::GraphjHeader::new_unsealed(1, 0);
-        header.flags |= graphj::FLAG_SEALED;
-        header.body_len = body_size as u64;
-        let header_bytes = graphj::encode_header(&header);
+        let header = JournalHeader {
+            flags: FLAG_SEALED,
+            compression: 0,
+            first_seq: 1,
+            last_seq: 1,
+            entry_count: 0,
+            body_len: body_size as u64,
+            body_checksum: [0u8; 32],
+            prev_segment_checksum: 0,
+            created_ms: 0,
+        };
+        let header_bytes = encode_header(&header);
         let body = vec![0u8; body_size];
         let mut data = Vec::new();
         data.extend_from_slice(&header_bytes);
@@ -347,63 +355,63 @@ mod tests {
     #[test]
     fn test_cache_mark_uploaded() {
         let dir = tempfile::tempdir().unwrap();
-        write_fake_sealed_segment(dir.path(), "seg-0001.graphj", 100);
-        write_fake_sealed_segment(dir.path(), "seg-0002.graphj", 200);
+        write_fake_sealed_segment(dir.path(), "seg-0001.hadbj", 100);
+        write_fake_sealed_segment(dir.path(), "seg-0002.hadbj", 200);
 
         let mut cache = SegmentCache::new(dir.path()).unwrap();
         assert_eq!(cache.pending_segments().unwrap().len(), 2);
 
-        cache.mark_uploaded("seg-0001.graphj").unwrap();
-        assert!(cache.is_uploaded("seg-0001.graphj"));
-        assert!(!cache.is_uploaded("seg-0002.graphj"));
+        cache.mark_uploaded("seg-0001.hadbj").unwrap();
+        assert!(cache.is_uploaded("seg-0001.hadbj"));
+        assert!(!cache.is_uploaded("seg-0002.hadbj"));
         assert_eq!(cache.pending_segments().unwrap().len(), 1);
     }
 
     #[test]
     fn test_cache_crash_recovery() {
         let dir = tempfile::tempdir().unwrap();
-        write_fake_sealed_segment(dir.path(), "seg-0001.graphj", 100);
-        write_fake_sealed_segment(dir.path(), "seg-0002.graphj", 200);
+        write_fake_sealed_segment(dir.path(), "seg-0001.hadbj", 100);
+        write_fake_sealed_segment(dir.path(), "seg-0002.hadbj", 200);
 
         // First open: mark one as uploaded.
         {
             let mut cache = SegmentCache::new(dir.path()).unwrap();
-            cache.mark_uploaded("seg-0001.graphj").unwrap();
+            cache.mark_uploaded("seg-0001.hadbj").unwrap();
         }
 
         // Reopen: manifest should persist.
         let cache = SegmentCache::new(dir.path()).unwrap();
-        assert!(cache.is_uploaded("seg-0001.graphj"));
-        assert!(!cache.is_uploaded("seg-0002.graphj"));
+        assert!(cache.is_uploaded("seg-0001.hadbj"));
+        assert!(!cache.is_uploaded("seg-0002.hadbj"));
         assert_eq!(cache.pending_segments().unwrap().len(), 1);
     }
 
     #[test]
     fn test_cache_reconcile_stale_entries() {
         let dir = tempfile::tempdir().unwrap();
-        write_fake_sealed_segment(dir.path(), "seg-0001.graphj", 100);
+        write_fake_sealed_segment(dir.path(), "seg-0001.hadbj", 100);
 
         // Mark as uploaded.
         {
             let mut cache = SegmentCache::new(dir.path()).unwrap();
-            cache.mark_uploaded("seg-0001.graphj").unwrap();
+            cache.mark_uploaded("seg-0001.hadbj").unwrap();
         }
 
         // Delete the file (simulating manual deletion or external cleanup).
-        std::fs::remove_file(dir.path().join("seg-0001.graphj")).unwrap();
+        std::fs::remove_file(dir.path().join("seg-0001.hadbj")).unwrap();
 
         // Reopen: reconcile should remove stale entry.
         let cache = SegmentCache::new(dir.path()).unwrap();
-        assert!(!cache.is_uploaded("seg-0001.graphj"));
+        assert!(!cache.is_uploaded("seg-0001.hadbj"));
     }
 
     #[test]
     fn test_cleanup_age_based() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_fake_sealed_segment(dir.path(), "seg-0001.graphj", 100);
+        let path = write_fake_sealed_segment(dir.path(), "seg-0001.hadbj", 100);
 
         let mut cache = SegmentCache::new(dir.path()).unwrap();
-        cache.mark_uploaded("seg-0001.graphj").unwrap();
+        cache.mark_uploaded("seg-0001.hadbj").unwrap();
 
         // Set file mtime to 2 hours ago.
         let two_hours_ago = std::time::SystemTime::now() - Duration::from_secs(7200);
@@ -420,7 +428,7 @@ mod tests {
         let stats = cache.cleanup(&config).unwrap();
         assert_eq!(stats.files_deleted, 1);
         assert!(!path.exists());
-        assert!(!cache.is_uploaded("seg-0001.graphj"));
+        assert!(!cache.is_uploaded("seg-0001.hadbj"));
     }
 
     #[test]
@@ -428,13 +436,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Create 3 segments: total size exceeds max.
         for i in 1..=3 {
-            write_fake_sealed_segment(dir.path(), &format!("seg-{i:04}.graphj"), 1000);
+            write_fake_sealed_segment(dir.path(), &format!("seg-{i:04}.hadbj"), 1000);
         }
 
         let mut cache = SegmentCache::new(dir.path()).unwrap();
         for i in 1..=3 {
             cache
-                .mark_uploaded(&format!("seg-{i:04}.graphj"))
+                .mark_uploaded(&format!("seg-{i:04}.hadbj"))
                 .unwrap();
         }
 
@@ -449,7 +457,7 @@ mod tests {
     #[test]
     fn test_cleanup_never_deletes_pending() {
         let dir = tempfile::tempdir().unwrap();
-        let pending_path = write_fake_sealed_segment(dir.path(), "seg-0001.graphj", 100);
+        let pending_path = write_fake_sealed_segment(dir.path(), "seg-0001.hadbj", 100);
 
         let mut cache = SegmentCache::new(dir.path()).unwrap();
         // Do NOT mark as uploaded — it's pending.
@@ -466,11 +474,11 @@ mod tests {
     #[test]
     fn test_cache_idempotent_mark() {
         let dir = tempfile::tempdir().unwrap();
-        write_fake_sealed_segment(dir.path(), "seg-0001.graphj", 100);
+        write_fake_sealed_segment(dir.path(), "seg-0001.hadbj", 100);
 
         let mut cache = SegmentCache::new(dir.path()).unwrap();
-        cache.mark_uploaded("seg-0001.graphj").unwrap();
-        cache.mark_uploaded("seg-0001.graphj").unwrap(); // second call is no-op
+        cache.mark_uploaded("seg-0001.hadbj").unwrap();
+        cache.mark_uploaded("seg-0001.hadbj").unwrap(); // second call is no-op
         assert_eq!(cache.pending_segments().unwrap().len(), 0);
     }
 }

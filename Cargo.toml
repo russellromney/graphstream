@@ -2,7 +2,7 @@
 name = "graphstream"
 version = "0.1.0"
 edition = "2021"
-description = "Journal replication engine for graph databases. Logical WAL shipping via .graphj segments to S3."
+description = "Journal replication engine for graph databases. Logical WAL shipping via .hadbj segments to S3."
 authors = ["Russell Romney <russellromney@gmail.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/russellromney/graphstream"
@@ -10,9 +10,7 @@ keywords = ["graph-database", "replication", "journal", "s3", "wal"]
 categories = ["database", "network-programming"]
 
 [dependencies]
-# Crypto + integrity
-sha2 = "0.10"
-crc32c = "0.6"
+# Crypto + integrity (encryption layered on top of hadbj)
 chacha20poly1305 = "0.10"
 rand = "0.9"
 
@@ -22,7 +20,8 @@ zstd = "0.13"
 # Protobuf
 prost = "0.13"
 
-# hadb ecosystem shared infrastructure (retry, S3, ObjectStore, webhook, retention)
+# hadb ecosystem
+hadb-changeset = { path = "../hadb-changeset", version = "0.3.1", features = ["journal"] }
 hadb-io = { path = "../hadb/hadb-io", features = ["s3"] }
 
 # Async runtime

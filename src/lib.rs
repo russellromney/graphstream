@@ -1,16 +1,16 @@
-//! graphstream — journal replication engine for graph databases.
+//! graphstream -- journal replication engine for graph databases.
 //!
-//! Logical WAL shipping via .graphj segments to S3. This crate provides the
+//! Logical WAL shipping via .hadbj segments to S3. This crate provides the
 //! replication machinery that graphd uses: journal format, writer/reader,
 //! S3 uploader, and follower sync.
 //!
-//! graphstream is to Kuzu/graphd what walrust is to SQLite — the replication
+//! graphstream is to Kuzu/graphd what walrust is to SQLite -- the replication
 //! engine, not the database server.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod cache;
-pub mod graphj;
+pub mod format;
 pub mod journal;
 pub mod metrics;
 pub mod sync;
