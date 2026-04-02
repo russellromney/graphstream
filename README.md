@@ -2,7 +2,7 @@
 
 > **Experimental.** graphstream is under active development and not yet stable. APIs will change without notice.
 
-Journal replication engine for graph databases. Logical WAL shipping via `.graphj` segments to S3-compatible storage.
+Journal replication engine for graph databases. Logical WAL shipping via `.hadbj` segments to S3-compatible storage.
 
 graphstream handles journal writing, segment rotation, upload/download, compaction, and segment replay for Kuzu/LadybugDB HA. Used by [hakuzu](https://github.com/russellromney/hakuzu) for graph database high availability.
 
@@ -10,7 +10,7 @@ Part of the [hadb](https://github.com/russellromney/hadb) ecosystem. Shared infr
 
 ## What it does
 
-1. **Journal writing**: Cypher queries + params written to `.graphj` segment files with SHA-256 chain hashing and CRC32C integrity checks.
+1. **Journal writing**: Cypher queries + params written to `.hadbj` segment files via hadb-changeset binary format with SHA-256 chain hashing.
 2. **Segment rotation**: Auto-rotate at configurable size (default 4MB). `SealForUpload` seals the current segment for upload.
 3. **S3 upload**: Sealed segments uploaded via `hadb_io::ObjectStore` trait. Up to 4 concurrent uploads via `JoinSet`. Supports `UploadWithAck` for synchronous upload confirmation (used by hakuzu's `sync()` for graceful shutdown).
 4. **Segment download**: Followers poll S3 for new segments via `ObjectStore` and download incrementally.
@@ -25,11 +25,11 @@ Part of the [hadb](https://github.com/russellromney/hadb) ecosystem. Shared infr
 ## Architecture
 
 ```
-Writer -> PendingEntry -> JournalWriter -> .graphj segments -> Uploader -> ObjectStore (S3)
+Writer -> PendingEntry -> JournalWriter -> .hadbj segments -> Uploader -> ObjectStore (S3)
                                               |                              |
                                      SegmentCache (manifest)     Background Compaction
                                                                              |
-Follower <- replay_entries <- JournalReader <- .graphj segments <- ObjectStore Download
+Follower <- replay_entries <- JournalReader <- .hadbj segments <- ObjectStore Download
 ```
 
 ### Entry format (protobuf)
@@ -45,10 +45,10 @@ message JournalEntry {
 
 ### Segment format
 
-Each `.graphj` segment is:
-- Header (128 bytes): magic bytes + version + flags (compression, encryption) + sequence range + body length
-- Body: length-prefixed protobuf entries with CRC32C checksums
-- Trailer (sealed only): 32-byte SHA-256 chain hash linking to previous segment
+Uses hadb-changeset's `.hadbj` binary format:
+- Header (128 bytes): HADBJ magic + flags (sealed, compressed, chain hash) + sequence range + body length + checksums
+- Body: binary entries (sequence + prev_hash + payload), zstd-compressed when sealed
+- Trailer (sealed only): 32-byte SHA-256 chain hash for O(1) recovery and cross-segment integrity
 
 ## Usage
 
@@ -75,18 +75,16 @@ tx.send(JournalCommand::Write(PendingEntry {
 let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 let (upload_tx, uploader_handle) = spawn_journal_uploader(
     tx.clone(), journal_dir, object_store, "prefix/".into(),
-    Duration::from_secs(10), shutdown_rx,
+    "mydb".into(), Duration::from_secs(10), shutdown_rx,
 );
 ```
 
 ## Dependencies
 
+- `hadb-changeset` -- `.hadbj` binary format (encode, decode, seal, chain hashing, S3 key layout)
 - `hadb-io` -- S3 via ObjectStore trait, retry, circuit breaker
-- `prost` -- Protobuf serialization
-- `sha2` -- Chain hash integrity
-- `crc32c` -- Entry checksum
-- `zstd` -- Compression (segment + streaming decompression)
-- `chacha20poly1305` -- Optional encryption
+- `prost` -- Protobuf serialization (journal entry payload)
+- `zstd` -- Compression (sealed segments)
 
 ## Tests
 
