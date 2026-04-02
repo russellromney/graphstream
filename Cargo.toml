@@ -1,6 +1,6 @@
 [package]
 name = "graphstream"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Journal replication engine for graph databases. Logical WAL shipping via .hadbj segments to S3."
 authors = ["Russell Romney <russellromney@gmail.com>"]
@@ -22,7 +22,7 @@ prost = "0.13"
 
 # hadb ecosystem
 hadb-changeset = { path = "../hadb-changeset", version = "0.3.1", features = ["journal"] }
-hadb-io = { path = "../hadb/hadb-io", features = ["s3"] }
+hadb-io = { path = "../hadb/hadb-io", version = "0.2", features = ["s3"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
