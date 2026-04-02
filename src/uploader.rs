@@ -114,9 +114,7 @@ struct UploadTaskContext {
     webhook: Option<Arc<hadb_io::WebhookSender>>,
 }
 
-struct UploadResult {
-    _segment_name: String,
-}
+struct UploadResult;
 
 impl UploadTaskContext {
     /// Upload a single sealed segment file with retry.
@@ -196,9 +194,7 @@ impl UploadTaskContext {
         }
 
         info!(segment = %file_name, key = %key, size_bytes = data_len, "Uploaded segment");
-        Ok(UploadResult {
-            _segment_name: file_name,
-        })
+        Ok(UploadResult)
     }
 }
 
@@ -718,7 +714,9 @@ pub async fn run_background_compaction(
             return Err(anyhow!("No entries found in input segments"));
         }
 
-        let segment = seal(all_entries, 0);
+        // Compute prev_segment_checksum from the chain hash preceding the first entry.
+        let prev_segment_checksum = hadb_changeset::journal::hash_to_u64(&all_entries[0].prev_hash);
+        let segment = seal(all_entries, prev_segment_checksum);
         let encoded = encode_compressed(&segment, zstd_level);
         std::fs::write(&output, &encoded)
             .map_err(|e| anyhow!("Write compacted: {e}"))?;
