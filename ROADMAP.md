@@ -1,12 +1,30 @@
 # graphstream Roadmap
 
+## Phase Torrent: DST + Property Tests
+
+Close the testing gap with walrust. graphstream has 86 tests but no chaos/property testing.
+
+### a. Property tests
+- [ ] Journal write/read round-trip with arbitrary entries (proptest)
+- [ ] Chain hash integrity under partial writes (crash mid-segment)
+- [ ] Segment rotation correctness (boundary conditions on max_segment_bytes)
+- [ ] Upload idempotency (same segment uploaded twice produces identical S3 state)
+
+### b. DST harness
+- [ ] `MockObjectStore` with fault injection (disk full, S3 timeout, partial write, silent corruption)
+- [ ] Simulate: writer + uploader + downloader under concurrent faults
+- [ ] Verify invariants after each simulation run
+
+### c. Core invariants
+- [ ] (1) Journal continuity: no sequence gaps after recovery
+- [ ] (2) Chain hash validity: every segment's prev_hash matches prior segment's hash
+- [ ] (3) Upload completeness: every sealed segment eventually uploaded
+- [ ] (4) Recovery from arbitrary segment loss: reader skips missing, resumes from next
+- [ ] (5) Compaction preserves all entries (streaming compaction output = input entries)
+
+---
+
 ## Deferred from Phase Aether
-
-> After: Phase Aether (completed) · Before: TBD
-
-### Aether-c: ConcurrentUploader migration
-
-hadb-io's `ConcurrentUploader<H>` uses `UploadMessage::Upload(Id) | Shutdown`. graphstream needs `UploadWithAck(PathBuf, oneshot::Sender)` for hakuzu's synchronous replication. Migrate after hadb-io gains ack support.
 
 ### Retention (GFS)
 
