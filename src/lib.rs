@@ -1,10 +1,11 @@
 //! graphstream -- journal replication engine for graph databases.
 //!
-//! Logical WAL shipping via .hadbj segments to S3. This crate provides the
-//! replication machinery that graphd uses: journal format, writer/reader,
-//! S3 uploader, and follower sync.
+//! Logical WAL shipping via .hadbj segments to any
+//! [`hadb_storage::StorageBackend`] (S3, Cinch HTTP, in-memory, local).
+//! Provides the replication machinery graphd uses: journal format,
+//! writer/reader, concurrent uploader, follower sync.
 //!
-//! graphstream is to Kuzu/graphd what walrust is to SQLite -- the replication
+//! graphstream is to Kuzu/graphd what walrust is to SQLite: the replication
 //! engine, not the database server.
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,10 +43,8 @@ pub use types::{
 };
 pub use cache::{CacheConfig, CacheStats, CleanupStats, SegmentCache};
 pub use metrics::GraphstreamMetrics;
-// Retry infrastructure from hadb-io (graphstream's retry.rs deleted in Phase Aether).
-pub use hadb_io::{RetryConfig, RetryPolicy};
 pub use uploader::{
     run_background_compaction, spawn_journal_uploader, spawn_journal_uploader_with_cache,
-    spawn_journal_uploader_with_retry, spawn_uploader, CompactionConfig, ObjectStoreStorage,
-    SegmentStorage, SegmentUploadHandler, UploadMessage, Uploader, UploaderStats,
+    spawn_uploader, CompactionConfig, SegmentUploadHandler, SegmentUploader, UploadMessage,
+    UploaderStats,
 };

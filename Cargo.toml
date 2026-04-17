@@ -20,9 +20,10 @@ zstd = "0.13"
 # Protobuf
 prost = "0.13"
 
-# hadb ecosystem
+# hadb ecosystem. Trait-only storage (Phase Anvil). No aws-sdk, no reqwest:
+# concrete backends are picked by embedders (hakuzu, cinch-engine).
 hadb-changeset = { path = "../hadb-changeset", version = "0.3.2", features = ["journal"] }
-hadb-io = { path = "../hadb/hadb-io", version = "0.4.0", features = ["s3"] }
+hadb-storage = { path = "../hadb/hadb-storage", version = "0.4.0" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

@@ -1,5 +1,29 @@
 # graphstream Changelog
 
+## Phase GraphForge: hadb-storage Trait Migration
+
+> After: Phase Drain . Before: Phase GraphCinch (cinch-cloud)
+
+Dropped `hadb-io` dependency entirely. All replication I/O now goes through
+`hadb_storage::StorageBackend` (the trait crate introduced by hadb Phase Anvil).
+Embedders (hakuzu, cinch-engine) pick the concrete backend: `CinchHttpStorage`
+for production, `S3Storage` for direct S3, `LocalStorage` / in-memory for tests.
+
+- Uploader `ConcurrentUploader<SegmentUploadHandler>` (re-exported from hadb-io)
+  replaced by an inline `SegmentUploader` struct that owns its own `JoinSet`
+  loop. Same bounded-concurrency + shutdown-drain semantics; ~400 lines of
+  hadb-io dependency deleted.
+- Dropped `RetryPolicy`, `RetryConfig`, `CircuitBreaker` re-exports. Retry is
+  now the storage backend's concern (`hadb-storage-s3` and `hadb-storage-cinch`
+  each retry transient failures internally).
+- Dropped `WebhookSender` / `WebhookConfig` / `WebhookEvent`. Nothing in
+  hakuzu or cinch-engine subscribed; re-add as a separate crate if needed.
+- Removed `SegmentStorage` / `ObjectStoreStorage` adapters and
+  `spawn_journal_uploader_with_retry`. `spawn_journal_uploader` and
+  `spawn_journal_uploader_with_cache` now take `Arc<dyn StorageBackend>`.
+- `sync::download_new_segments` takes `&dyn StorageBackend`.
+- 36 lib tests green (including the full uploader test suite).
+
 ## Phase Aether: hadb-io Migration
 
 > After: Phase 8 (Structured Tracing) · Before: Phase Drain
