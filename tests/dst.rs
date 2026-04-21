@@ -17,7 +17,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use graphstream::journal::{self, JournalCommand, JournalReader, JournalState, PendingEntry};
 use graphstream::types::ParamValue;
-use hadb_io::ObjectStore;
+use hadb_storage::{CasResult, StorageBackend};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -156,8 +156,8 @@ impl FaultyObjectStore {
 }
 
 #[async_trait]
-impl hadb_io::ObjectStore for FaultyObjectStore {
-    async fn upload_bytes(&self, key: &str, data: Vec<u8>) -> Result<()> {
+impl StorageBackend for FaultyObjectStore {
+    async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         self.bump_ops();
 
         if self.should_fail() {
@@ -170,43 +170,20 @@ impl hadb_io::ObjectStore for FaultyObjectStore {
                 self.pending_objects
                     .lock()
                     .expect("lock pending")
-                    .insert(key.to_string(), (data, visible_at));
+                    .insert(key.to_string(), (data.to_vec(), visible_at));
             }
             _ => {
                 self.objects
                     .lock()
                     .expect("lock objects")
-                    .insert(key.to_string(), data);
+                    .insert(key.to_string(), data.to_vec());
             }
         }
 
         Ok(())
     }
 
-    async fn upload_bytes_with_checksum(
-        &self,
-        key: &str,
-        data: Vec<u8>,
-        _checksum: &str,
-    ) -> Result<()> {
-        self.upload_bytes(key, data).await
-    }
-
-    async fn upload_file(&self, key: &str, path: &Path) -> Result<()> {
-        let data = std::fs::read(path)?;
-        self.upload_bytes(key, data).await
-    }
-
-    async fn upload_file_with_checksum(
-        &self,
-        key: &str,
-        path: &Path,
-        _checksum: &str,
-    ) -> Result<()> {
-        self.upload_file(key, path).await
-    }
-
-    async fn download_bytes(&self, key: &str) -> Result<Vec<u8>> {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.bump_ops();
         self.promote_pending();
 
@@ -214,33 +191,24 @@ impl hadb_io::ObjectStore for FaultyObjectStore {
             return Err(anyhow!("Injected S3 download error for key: {}", key));
         }
 
-        let data = self
-            .objects
-            .lock()
-            .expect("lock objects")
-            .get(key)
-            .cloned()
-            .ok_or_else(|| anyhow!("Not found: {}", key))?;
+        let data = match self.objects.lock().expect("lock objects").get(key).cloned() {
+            Some(d) => d,
+            None => return Ok(None),
+        };
 
         match &self.fault_mode {
             FaultMode::PartialWrite(keep_fraction) => {
                 let keep = (data.len() as f64 * keep_fraction) as usize;
-                Ok(data[..keep.max(1)].to_vec())
+                Ok(Some(data[..keep.max(1)].to_vec()))
             }
             FaultMode::SilentCorruption { flip_probability } => {
-                Ok(self.corrupt_data(&data, *flip_probability))
+                Ok(Some(self.corrupt_data(&data, *flip_probability)))
             }
-            _ => Ok(data),
+            _ => Ok(Some(data)),
         }
     }
 
-    async fn download_file(&self, key: &str, path: &Path) -> Result<()> {
-        let data = self.download_bytes(key).await?;
-        std::fs::write(path, data)?;
-        Ok(())
-    }
-
-    async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
         self.bump_ops();
         self.promote_pending();
 
@@ -252,28 +220,10 @@ impl hadb_io::ObjectStore for FaultyObjectStore {
         let mut keys: Vec<String> = objects
             .keys()
             .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect();
-        keys.sort();
-        Ok(keys)
-    }
-
-    async fn list_objects_after(
-        &self,
-        prefix: &str,
-        start_after: &str,
-    ) -> Result<Vec<String>> {
-        self.bump_ops();
-        self.promote_pending();
-
-        if self.should_fail() {
-            return Err(anyhow!("Injected S3 list_after error"));
-        }
-
-        let objects = self.objects.lock().expect("lock objects");
-        let mut keys: Vec<String> = objects
-            .keys()
-            .filter(|k| k.starts_with(prefix) && k.as_str() > start_after)
+            .filter(|k| match after {
+                Some(a) => k.as_str() > a,
+                None => true,
+            })
             .cloned()
             .collect();
         keys.sort();
@@ -286,19 +236,14 @@ impl hadb_io::ObjectStore for FaultyObjectStore {
         Ok(self.objects.lock().expect("lock").contains_key(key))
     }
 
-    async fn get_checksum(&self, _key: &str) -> Result<Option<String>> {
-        self.bump_ops();
-        Ok(None)
-    }
-
-    async fn delete_object(&self, key: &str) -> Result<()> {
+    async fn delete(&self, key: &str) -> Result<()> {
         self.bump_ops();
         self.objects.lock().expect("lock").remove(key);
         self.pending_objects.lock().expect("lock").remove(key);
         Ok(())
     }
 
-    async fn delete_objects(&self, keys: &[String]) -> Result<usize> {
+    async fn delete_many(&self, keys: &[String]) -> Result<usize> {
         self.bump_ops();
         let mut objects = self.objects.lock().expect("lock");
         let mut pending = self.pending_objects.lock().expect("lock");
@@ -312,7 +257,29 @@ impl hadb_io::ObjectStore for FaultyObjectStore {
         Ok(count)
     }
 
-    fn bucket_name(&self) -> &str {
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+        // The DST harness exercises journal upload paths only; CAS isn't on the
+        // path under test. Implement straightforward semantics for completeness
+        // — fault injection still applies via `put` if a future test wires it.
+        let exists = self.objects.lock().expect("lock").contains_key(key)
+            || self.pending_objects.lock().expect("lock").contains_key(key);
+        if exists {
+            return Ok(CasResult { success: false, etag: None });
+        }
+        self.put(key, data).await?;
+        Ok(CasResult { success: true, etag: Some("v1".into()) })
+    }
+
+    async fn put_if_match(&self, key: &str, data: &[u8], _etag: &str) -> Result<CasResult> {
+        let exists = self.objects.lock().expect("lock").contains_key(key);
+        if !exists {
+            return Ok(CasResult { success: false, etag: None });
+        }
+        self.put(key, data).await?;
+        Ok(CasResult { success: true, etag: Some("v2".into()) })
+    }
+
+    fn backend_name(&self) -> &str {
         "faulty-mock-bucket"
     }
 }
@@ -405,7 +372,7 @@ async fn upload_segments(
         );
 
         let data = std::fs::read(path).expect("read segment file");
-        match store.upload_bytes(&key, data).await {
+        match store.put(&key, &data).await {
             Ok(()) => uploaded.push(key),
             Err(_) => { /* fault injected, skip */ }
         }
@@ -555,9 +522,10 @@ async fn dst_random_upload_errors_then_retry() {
 
     for (i, key) in all_uploaded.iter().enumerate() {
         let data = clean_store
-            .download_bytes(key)
+            .get(key)
             .await
-            .expect("download should succeed");
+            .expect("get should succeed")
+            .expect("segment should be present in clean store");
         let _local_name = format!("journal-{:016}.hadbj", i + 1);
         // Use the original segment filenames to reconstruct.
         let orig_name = segments[i]
@@ -600,7 +568,7 @@ async fn dst_eventual_consistency() {
 
     // Perform enough operations to make everything visible.
     for _ in 0..20 {
-        let _ = store.list_objects(prefix).await;
+        let _ = store.list(prefix, None).await;
     }
 
     let visible_after = store.visible_keys();
@@ -735,7 +703,11 @@ async fn dst_upload_download_integrity() {
     std::fs::create_dir_all(&download_dir).expect("mkdir");
 
     for (seg_path, key) in segments.iter().zip(uploaded.iter()) {
-        let data = store.download_bytes(key).await.expect("download");
+        let data = store
+            .get(key)
+            .await
+            .expect("get")
+            .expect("uploaded segment should be present");
         let orig_name = seg_path
             .file_name()
             .expect("file_name")
@@ -786,7 +758,7 @@ async fn dst_silent_corruption_detected() {
     for key in &uploaded {
         let data = clean_store.get_raw(key).expect("raw data");
         corrupt_store
-            .upload_bytes(key, data)
+            .put(key, &data)
             .await
             .expect("upload to corrupt store");
     }
@@ -797,9 +769,10 @@ async fn dst_silent_corruption_detected() {
 
     for (seg_path, key) in segments.iter().zip(uploaded.iter()) {
         let data = corrupt_store
-            .download_bytes(key)
+            .get(key)
             .await
-            .expect("download");
+            .expect("get")
+            .expect("segment should be present (corruption returns Some)");
         let orig_name = seg_path
             .file_name()
             .expect("file_name")
@@ -938,7 +911,7 @@ async fn dst_partial_write_detection() {
     for key in &uploaded {
         let data = clean_store.get_raw(key).expect("raw");
         truncating_store
-            .upload_bytes(key, data)
+            .put(key, &data)
             .await
             .expect("upload");
     }
@@ -949,9 +922,10 @@ async fn dst_partial_write_detection() {
 
     for (seg_path, key) in segments.iter().zip(uploaded.iter()) {
         let data = truncating_store
-            .download_bytes(key)
+            .get(key)
             .await
-            .expect("download");
+            .expect("get")
+            .expect("segment should be present (truncation still returns Some)");
         let orig_name = seg_path
             .file_name()
             .expect("file_name")
@@ -1113,7 +1087,7 @@ async fn dst_concurrent_writer_uploader_downloader() {
             let data = std::fs::read(&sealed_path).expect("read segment");
             // Retries: try up to 5 times (faults are 30%).
             for _attempt in 0..5 {
-                if uploader_store.upload_bytes(&key, data.clone()).await.is_ok() {
+                if uploader_store.put(&key, &data).await.is_ok() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1131,7 +1105,7 @@ async fn dst_concurrent_writer_uploader_downloader() {
         for _poll in 0..10 {
             tokio::time::sleep(Duration::from_millis(30)).await;
 
-            let keys = match reader_store.list_objects(&reader_prefix).await {
+            let keys = match reader_store.list(&reader_prefix, None).await {
                 Ok(k) => k,
                 Err(_) => continue, // fault injected on list
             };
@@ -1140,8 +1114,8 @@ async fn dst_concurrent_writer_uploader_downloader() {
                 if downloaded.contains(key) {
                     continue;
                 }
-                match reader_store.download_bytes(key).await {
-                    Ok(data) => {
+                match reader_store.get(key).await {
+                    Ok(Some(data)) => {
                         // Extract filename from key for local storage.
                         let filename = key
                             .rsplit('/')
@@ -1151,6 +1125,7 @@ async fn dst_concurrent_writer_uploader_downloader() {
                             .expect("write downloaded segment");
                         downloaded.push(key.clone());
                     }
+                    Ok(None) => { /* eventual consistency: not visible yet */ }
                     Err(_) => { /* fault injected on download */ }
                 }
             }

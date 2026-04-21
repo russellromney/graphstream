@@ -1,6 +1,6 @@
 [package]
 name = "graphstream"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Journal replication engine for graph databases. Logical WAL shipping via .hadbj segments to S3."
 authors = ["Russell Romney <russellromney@gmail.com>"]
@@ -54,3 +54,9 @@ uuid = { version = "1", features = ["v4"] }
 hex = "0.4"
 filetime = "0.2"
 proptest = "1"
+# Tests need an in-memory + S3 StorageBackend implementation. Library code
+# stays trait-only against `hadb-storage`; concrete backends only enter at
+# the test layer.
+hadb-storage-s3 = { path = "../hadb/hadb-storage-s3", version = "0.4.0" }
+aws-sdk-s3 = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }

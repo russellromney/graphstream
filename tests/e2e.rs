@@ -8,18 +8,32 @@ use graphstream::journal::{self, JournalCommand, JournalReader, JournalState, Pe
 use graphstream::sync::download_new_segments;
 use graphstream::types::ParamValue;
 use hadb_changeset::storage::{format_key, ChangesetKind, GENERATION_INCREMENTAL};
-use hadb_io::{ObjectStore, S3Backend};
+use hadb_storage::StorageBackend;
+use hadb_storage_s3::S3Storage;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Create S3Backend + unique prefix from env vars.
-async fn s3_setup() -> (Arc<S3Backend>, String) {
+/// Create an `S3Storage` from `S3_TEST_BUCKET` (+ optional `S3_ENDPOINT`)
+/// and a unique key prefix for this test run.
+async fn s3_setup() -> (Arc<S3Storage>, String) {
     let bucket =
         std::env::var("S3_TEST_BUCKET").expect("S3_TEST_BUCKET env var required for e2e tests");
     let endpoint = std::env::var("S3_ENDPOINT").ok();
-    let backend = S3Backend::from_env(bucket, endpoint.as_deref())
-        .await
-        .expect("Failed to create S3Backend");
+    let s3_config = match endpoint.as_deref() {
+        Some(ep) => {
+            aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .endpoint_url(ep)
+                .load()
+                .await
+        }
+        None => {
+            aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .load()
+                .await
+        }
+    };
+    let client = aws_sdk_s3::Client::new(&s3_config);
+    let backend = S3Storage::new(client, bucket);
     let prefix = format!("graphstream-e2e-{}/", uuid::Uuid::new_v4());
     (Arc::new(backend), prefix)
 }
@@ -63,7 +77,7 @@ fn write_and_seal(
 
 /// Upload all sealed .hadbj files using hadb-changeset key format.
 async fn upload_sealed_files(
-    store: &dyn ObjectStore,
+    store: &dyn StorageBackend,
     journal_dir: &std::path::Path,
     prefix: &str,
     db_name: &str,
@@ -86,7 +100,7 @@ async fn upload_sealed_files(
 
         let key = format_key(prefix, db_name, GENERATION_INCREMENTAL, seq, ChangesetKind::Journal);
         let bytes = std::fs::read(&path).unwrap();
-        store.upload_bytes(&key, bytes).await.unwrap();
+        store.put(&key, &bytes).await.unwrap();
         uploaded.push(key);
     }
     uploaded

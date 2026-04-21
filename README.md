@@ -6,30 +6,30 @@ Journal replication engine for graph databases. Logical WAL shipping via `.hadbj
 
 graphstream handles journal writing, segment rotation, upload/download, compaction, and segment replay for Kuzu/LadybugDB HA. Used by [hakuzu](https://github.com/russellromney/hakuzu) for graph database high availability.
 
-Part of the [hadb](https://github.com/russellromney/hadb) ecosystem. Shared infrastructure (S3 via ObjectStore trait, retry, circuit breaker) provided by [hadb-io](https://github.com/russellromney/hadb/tree/main/hadb-io).
+Part of the [hadb](https://github.com/russellromney/hadb) ecosystem. graphstream is trait-only at the library layer — concrete S3/HTTP backends are picked by the embedder (hakuzu, the cinch engine, …) via the `hadb-storage` `StorageBackend` trait.
 
 ## What it does
 
 1. **Journal writing**: Cypher queries + params written to `.hadbj` segment files via hadb-changeset binary format with SHA-256 chain hashing.
 2. **Segment rotation**: Auto-rotate at configurable size (default 4MB). `SealForUpload` seals the current segment for upload.
-3. **S3 upload**: Sealed segments uploaded via `hadb_io::ObjectStore` trait. Up to 4 concurrent uploads via `JoinSet`. Supports `UploadWithAck` for synchronous upload confirmation (used by hakuzu's `sync()` for graceful shutdown).
-4. **Segment download**: Followers poll S3 for new segments via `ObjectStore` and download incrementally.
+3. **S3 upload**: Sealed segments uploaded via the `hadb_storage::StorageBackend` trait. Up to 4 concurrent uploads via `JoinSet`. Supports `UploadWithAck` for synchronous upload confirmation (used by hakuzu's `sync()` for graceful shutdown).
+4. **Segment download**: Followers poll S3 for new segments via `StorageBackend` and download incrementally.
 5. **Journal reader**: Streaming reads from segments, 1MB `BufReader`, streaming zstd decompression for compressed segments (encrypted segments use full-body decode).
 6. **Compression + encryption**: Optional zstd compression and ChaCha20-Poly1305 encryption per segment.
 7. **Disk cache**: Manifest-based upload tracking with age/size-based cleanup. Crash-safe (write `.tmp` + rename).
 8. **Compaction**: Streaming compaction merges segments without loading all into memory. Background compaction triggers after N uploaded segments.
 9. **O(1) recovery**: 32-byte chain hash trailer on sealed segments. Recovery reads one header + trailer instead of scanning all entries.
-10. **Retry + circuit breaker**: Via hadb-io. Transient errors retried with exponential backoff + jitter. Circuit breaker prevents hammering degraded endpoints.
+10. **Retry + circuit breaker**: Concrete `StorageBackend` impls (e.g. `hadb-storage-s3`) own retry and circuit breaking; graphstream stays out of that policy.
 11. **Prometheus metrics**: Lock-free `AtomicU64` counters for entries, segments, uploads, downloads, errors, bytes. `snapshot().to_prometheus()` text format.
 
 ## Architecture
 
 ```
-Writer -> PendingEntry -> JournalWriter -> .hadbj segments -> Uploader -> ObjectStore (S3)
+Writer -> PendingEntry -> JournalWriter -> .hadbj segments -> Uploader -> StorageBackend (S3/HTTP/...)
                                               |                              |
                                      SegmentCache (manifest)     Background Compaction
                                                                              |
-Follower <- replay_entries <- JournalReader <- .hadbj segments <- ObjectStore Download
+Follower <- replay_entries <- JournalReader <- .hadbj segments <- StorageBackend Download
 ```
 
 ### Entry format (protobuf)
@@ -71,7 +71,7 @@ tx.send(JournalCommand::Write(PendingEntry {
     uuid_override: None,
 }))?;
 
-// Spawn S3 uploader (streams sealed segments via ObjectStore)
+// Spawn S3 uploader (streams sealed segments via `hadb_storage::StorageBackend`)
 let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 let (upload_tx, uploader_handle) = spawn_journal_uploader(
     tx.clone(), journal_dir, object_store, "prefix/".into(),
@@ -82,7 +82,7 @@ let (upload_tx, uploader_handle) = spawn_journal_uploader(
 ## Dependencies
 
 - `hadb-changeset` -- `.hadbj` binary format (encode, decode, seal, chain hashing, S3 key layout)
-- `hadb-io` -- S3 via ObjectStore trait, retry, circuit breaker
+- `hadb-storage` -- byte-level `StorageBackend` trait. Concrete impls (`hadb-storage-s3`, `hadb-storage-cinch`, …) are picked by the embedder
 - `prost` -- Protobuf serialization (journal entry payload)
 - `zstd` -- Compression (sealed segments)
 
