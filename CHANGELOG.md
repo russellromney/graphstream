@@ -1,5 +1,36 @@
 # graphstream Changelog
 
+## Phase GraphFjord: Finish hadb-io → hadb-storage in tests
+
+> After: Phase GraphForge
+
+Phase Aether dropped the `hadb-io` dependency from the library and the
+uploader, but `tests/dst.rs` and `tests/e2e.rs` still imported
+`hadb_io::ObjectStore` / `hadb_io::S3Backend`. They no longer compiled
+against current hadb. Finished the migration so the test suite is
+green again.
+
+- `tests/dst.rs`: reimplement `FaultyObjectStore` on
+  `hadb_storage::StorageBackend`. Fault modes (random error, partial
+  write, silent corruption, eventual consistency) preserved
+  end-to-end. The "missing key" path now returns `Ok(None)`
+  (StorageBackend semantics) rather than `Err`; the concurrent
+  writer/downloader test handles both branches.
+- `tests/e2e.rs`: construct `hadb_storage_s3::S3Storage` from
+  `aws-sdk-s3::Client`, honoring `S3_TEST_BUCKET` / `S3_ENDPOINT` as
+  before. Tests still `--ignored` by default (S3 required).
+- Added `hadb-storage-s3`, `aws-sdk-s3`, `aws-config` to
+  `dev-dependencies`. Library stays trait-only against `hadb-storage`.
+- README + ROADMAP: dropped stale `hadb-io` paragraphs.
+
+`hadb-changeset` dep stays at 0.3.2 (standalone repo,
+[russellromney/hadb-changeset](https://github.com/russellromney/hadb-changeset),
+is the only crate shipping the `journal` feature — the in-tree
+`hadb/hadb-changeset` workspace member at 0.4.0 doesn't yet).
+Re-aligning these is separate future work.
+
+79 tests green at ship (plus 4 `--ignored` e2e requiring real S3).
+
 ## Phase GraphForge: hadb-storage Trait Migration
 
 > After: Phase Drain . Before: Phase GraphCinch (cinch-cloud)
