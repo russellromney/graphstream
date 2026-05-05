@@ -94,12 +94,16 @@ async fn upload_sealed_files(
             continue;
         }
 
-        // Parse seq from filename: journal-{seq:016}.hadbj
-        let seq_str = name.strip_prefix("journal-").unwrap().strip_suffix(".hadbj").unwrap();
-        let seq: u64 = seq_str.parse().unwrap();
-
-        let key = format_key(prefix, db_name, GENERATION_INCREMENTAL, seq, ChangesetKind::Journal);
         let bytes = std::fs::read(&path).unwrap();
+        let header = hadb_changeset::journal::decode_header(&bytes).unwrap();
+        assert!(header.is_sealed(), "upload helper only publishes sealed segments");
+        let key = format_key(
+            prefix,
+            db_name,
+            GENERATION_INCREMENTAL,
+            header.first_seq,
+            ChangesetKind::Journal,
+        );
         store.put(&key, &bytes).await.unwrap();
         uploaded.push(key);
     }

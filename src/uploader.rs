@@ -252,19 +252,24 @@ impl SegmentUploadHandler {
             .ok_or_else(|| anyhow!("Invalid segment path: {}", path.display()))?
             .to_string();
 
-        let seq = parse_seq_from_filename(&file_name)
-            .ok_or_else(|| anyhow!("Cannot parse seq from filename: {}", file_name))?;
+        let data = tokio::fs::read(&path)
+            .await
+            .map_err(|e| anyhow!("Read {}: {e}", path.display()))?;
+        let header = hadb_changeset::journal::decode_header(&data)
+            .map_err(|e| anyhow!("Decode .hadbj header {}: {e}", path.display()))?;
+        if !header.is_sealed() {
+            return Err(anyhow!("Refusing to upload unsealed .hadbj: {}", path.display()));
+        }
+        hadb_changeset::journal::decode(&data)
+            .map_err(|e| anyhow!("Verify .hadbj {} before upload: {e}", path.display()))?;
+
         let key = hadb_changeset::storage::format_key(
             &self.prefix,
             &self.db_name,
             hadb_changeset::storage::GENERATION_INCREMENTAL,
-            seq,
+            header.first_seq,
             hadb_changeset::storage::ChangesetKind::Journal,
         );
-
-        let data = tokio::fs::read(&path)
-            .await
-            .map_err(|e| anyhow!("Read {}: {e}", path.display()))?;
         let data_len = data.len() as u64;
 
         self.storage
@@ -466,18 +471,6 @@ pub fn spawn_journal_uploader_with_cache(
     (upload_tx, handle)
 }
 
-/// Parse sequence number from a journal segment filename.
-/// Handles both "journal-{seq:016}.hadbj" and "compacted-{timestamp}.hadbj".
-fn parse_seq_from_filename(filename: &str) -> Option<u64> {
-    if let Some(stem) = filename.strip_prefix("journal-").and_then(|s| s.strip_suffix(".hadbj")) {
-        return stem.parse::<u64>().ok();
-    }
-    if let Some(stem) = filename.strip_prefix("compacted-").and_then(|s| s.strip_suffix(".hadbj")) {
-        return stem.parse::<u64>().ok();
-    }
-    None
-}
-
 /// Scan journal_dir for sealed .hadbj files. Returns their paths.
 fn scan_sealed_segments(journal_dir: &Path) -> Result<Vec<PathBuf>> {
     let entries = std::fs::read_dir(journal_dir)
@@ -642,6 +635,7 @@ pub async fn run_background_compaction(
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use hadb_changeset::journal::{encode, seal, JournalEntry};
     use hadb_storage::CasResult;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -803,8 +797,23 @@ mod tests {
     }
 
     fn write_fake_segment(dir: &Path, name: &str, content: &[u8]) -> PathBuf {
+        let seq = name
+            .strip_prefix("journal-")
+            .and_then(|s| s.strip_suffix(".hadbj"))
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(1);
+        write_segment_with_first_seq(dir, name, seq, content)
+    }
+
+    fn write_segment_with_first_seq(dir: &Path, name: &str, seq: u64, content: &[u8]) -> PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, content).unwrap();
+        let entry = JournalEntry {
+            sequence: seq,
+            prev_hash: [0u8; 32],
+            payload: content.to_vec(),
+        };
+        let bytes = encode(&seal(vec![entry], 0));
+        std::fs::write(&path, bytes).unwrap();
         path
     }
 
@@ -1006,7 +1015,16 @@ mod tests {
         assert_eq!(stats.uploads_attempted, 5);
         assert_eq!(stats.uploads_succeeded, 5);
         assert_eq!(stats.uploads_failed, 0);
-        assert_eq!(stats.bytes_uploaded, 5 * data.len() as u64);
+        assert_eq!(
+            stats.bytes_uploaded,
+            storage
+                .objects
+                .lock()
+                .unwrap()
+                .values()
+                .map(|v| v.len() as u64)
+                .sum::<u64>()
+        );
     }
 
     #[tokio::test]
@@ -1092,6 +1110,29 @@ mod tests {
         timeout(Duration::from_secs(5), handle).await.unwrap().unwrap();
 
         assert_eq!(storage.object_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_compacted_upload_uses_hadbj_header_sequence() {
+        let storage = Arc::new(MockStorage::new());
+        let uploader = make_uploader(storage.clone(), 4);
+        let (tx, handle) = spawn_uploader(uploader);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_segment_with_first_seq(
+            dir.path(),
+            "compacted-9999999999999.hadbj",
+            42,
+            b"compacted",
+        );
+
+        tx.send(UploadMessage::Upload(path)).await.unwrap();
+        tx.send(UploadMessage::Shutdown).await.unwrap();
+
+        timeout(Duration::from_secs(5), handle).await.unwrap().unwrap();
+
+        assert_eq!(storage.object_count(), 1);
+        assert!(storage.has_key("test/db/0000/000000000000002a.hadbj"));
     }
 
     fn create_sealed_segments(journal_dir: &Path, entry_count: usize, segment_max_bytes: u64) {
