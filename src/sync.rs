@@ -1,14 +1,15 @@
 //! Follower sync: download new journal segments from a StorageBackend.
 //!
-//! Uses hadb-changeset's storage key layout, but treats the `.hadbj` segment
-//! header as the source of truth for replay coverage. Retry is the backend's
+//! Uses hadb-changeset's storage key layout, then verifies each `.hadbj`
+//! segment's key, header, body checksum, and decoded entry coverage before
+//! considering it part of the replay range. Retry is the backend's
 //! responsibility; `hadb-storage-s3` and `hadb-storage-cinch` both retry
 //! transient failures inside `get` / `list`, so this layer stays thin.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail};
-use hadb_changeset::journal::{decode, decode_header};
+use hadb_changeset::journal::{decode, decode_header, JournalSegment};
 use hadb_changeset::storage::GENERATION_INCREMENTAL;
 use hadb_storage::StorageBackend;
 use tracing::debug;
@@ -127,19 +128,60 @@ async fn discover_verified_journal_segments(
                 header.last_seq
             );
         }
-        if header.last_seq <= since_seq {
+        let segment =
+            decode(&bytes).map_err(|e| anyhow!("verify journal segment {key}: {e}"))?;
+        validate_decoded_journal_segment(&key, &segment)?;
+        if segment.header.last_seq <= since_seq {
             continue;
         }
-        decode(&bytes).map_err(|e| anyhow!("verify journal segment {key}: {e}"))?;
         segments.push(VerifiedJournalSegment {
             key,
-            first_seq: header.first_seq,
-            last_seq: header.last_seq,
+            first_seq: segment.header.first_seq,
+            last_seq: segment.header.last_seq,
             bytes,
         });
     }
 
     Ok(segments)
+}
+
+fn validate_decoded_journal_segment(key: &str, segment: &JournalSegment) -> anyhow::Result<()> {
+    if segment.entries.is_empty() {
+        bail!("journal segment {key} has no decoded entries");
+    }
+
+    let first_entry = segment.entries.first().expect("checked non-empty").sequence;
+    let last_entry = segment.entries.last().expect("checked non-empty").sequence;
+    if first_entry != segment.header.first_seq {
+        bail!(
+            "journal segment {key} header first_seq {} does not match first entry {}",
+            segment.header.first_seq,
+            first_entry
+        );
+    }
+    if last_entry != segment.header.last_seq {
+        bail!(
+            "journal segment {key} header last_seq {} does not match last entry {}",
+            segment.header.last_seq,
+            last_entry
+        );
+    }
+
+    let mut expected = segment.header.first_seq;
+    for entry in &segment.entries {
+        if entry.sequence != expected {
+            bail!(
+                "journal segment {key} has non-contiguous entry sequence {}; expected {}",
+                entry.sequence,
+                expected
+            );
+        }
+        expected = expected
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("journal segment {key} sequence overflow"))?;
+    }
+
+    Ok(())
 }
 
 fn parse_journal_key(journal_prefix: &str, key: &str) -> Option<u64> {
@@ -281,11 +323,10 @@ mod tests {
         )
     }
 
-    fn segment_bytes(first_seq: u64, entry_count: u64) -> Vec<u8> {
+    fn segment_bytes_for_sequences(sequences: &[u64]) -> Vec<u8> {
         let mut prev_hash = [0u8; 32];
         let mut entries = Vec::new();
-        for offset in 0..entry_count {
-            let sequence = first_seq + offset;
+        for &sequence in sequences {
             let payload = format!("entry-{sequence}").into_bytes();
             let entry = JournalEntry {
                 sequence,
@@ -296,6 +337,11 @@ mod tests {
             entries.push(entry);
         }
         encode(&seal(entries, 0))
+    }
+
+    fn segment_bytes(first_seq: u64, entry_count: u64) -> Vec<u8> {
+        let sequences: Vec<u64> = (0..entry_count).map(|offset| first_seq + offset).collect();
+        segment_bytes_for_sequences(&sequences)
     }
 
     fn unsealed_segment_header(first_seq: u64) -> Vec<u8> {
@@ -416,6 +462,38 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("key/header sequence mismatch"), "{err}");
+        assert!(!journal_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn header_range_must_match_decoded_entries() {
+        let store = MockStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+        let mut bytes = segment_bytes(1, 2);
+        bytes[20..28].copy_from_slice(&10u64.to_be_bytes());
+
+        store.put_sync(&journal_key("test/", "mydb", 1), bytes);
+
+        let err = download_new_segments(&store, "test/", "mydb", &journal_dir, 0)
+            .await
+            .unwrap_err();
+        assert!(err.contains("header last_seq"), "{err}");
+        assert!(!journal_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn decoded_entries_must_be_contiguous() {
+        let store = MockStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+
+        store.put_sync(&journal_key("test/", "mydb", 1), segment_bytes_for_sequences(&[1, 3]));
+
+        let err = download_new_segments(&store, "test/", "mydb", &journal_dir, 0)
+            .await
+            .unwrap_err();
+        assert!(err.contains("non-contiguous"), "{err}");
         assert!(!journal_dir.exists());
     }
 
